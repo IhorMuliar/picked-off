@@ -1,0 +1,6 @@
+# Host toolchain (IDL build, cargo test). SBF builds use platform-tools v1.52
+# (rustc 1.89.0) via `cargo build-sbf --tools-version v1.52`, see Makefile.
+[toolchain]
+channel = "1.89.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

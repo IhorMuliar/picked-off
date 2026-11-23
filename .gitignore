@@ -1,0 +1,23 @@
+# build output
+target/
+.anchor/
+test-ledger/
+**/dist/
+**/node_modules/
+*.tsbuildinfo
+
+# keys: never commit any keypair
+*-keypair.json
+*keypair*.json
+id.json
+*.key
+*.pem
+.env
+.env.*
+!.env.example
+
+# editor / os
+.DS_Store
+.vscode/
+.idea/
+*.log

@@ -1,0 +1,27 @@
+[toolchain]
+anchor_version = "1.0.2"
+# Pin to the machine's active Agave release. Without solana_version, Anchor 1.0.2
+# runs `agave-install init` for its own default (3.0.0 or 3.1.10) and repoints the
+# global ~/.local/share/solana/install/active_release on every invocation.
+solana_version = "4.1.2"
+package_manager = "npm"
+
+[workspace]
+members = ["programs/ping"]
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.localnet]
+ping = "5eP2A36T97mwaGHf6XoHZU6VoKh1NGxA2QwvtJhAJ6ms"
+
+[programs.devnet]
+ping = "5eP2A36T97mwaGHf6XoHZU6VoKh1NGxA2QwvtJhAJ6ms"
+
+[provider]
+cluster = "devnet"
+wallet = "~/.config/solana/blitz-ping-devnet.json"
+
+[scripts]
+test = "npm test"

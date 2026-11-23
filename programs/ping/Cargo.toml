@@ -1,0 +1,29 @@
+[package]
+name = "ping"
+version = "0.1.0"
+description = "Ping: hide a stake on a dark ladder, ping to find theirs (MagicBlock PER)"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "ping"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build"]
+anchor-debug = []
+custom-heap = []
+custom-panic = []
+
+[dependencies]
+anchor-lang = "=1.0.2"
+# Pinned: 0.20.x needs validator 2.0 (devnet-us only) and breaks #[vrf]; 0.17.3 runs
+# on devnet-tee and mainnet-tee.
+ephemeral-rollups-sdk = { version = "=0.17.3", features = ["anchor", "access-control", "crank", "vrf"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }
