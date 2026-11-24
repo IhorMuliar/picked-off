@@ -22,18 +22,21 @@ function BeatRing() {
       let frac = 0;
       let label = "";
       if (c.phase === "live") {
-        const left = Math.max(0, c.beatEndsAt - t);
+        // the store updates the deadline when the next beat lands; until then keep turning
+        let end = c.beatEndsAt;
+        if (end > 0 && end < t) end += Math.ceil((t - end) / BEAT_MS) * BEAT_MS;
+        const left = end > 0 ? Math.min(BEAT_MS, end - t) : 0;
         frac = left / BEAT_MS;
-        label = `beat ${(left / 1000).toFixed(1)} s`;
+        label = `next beat ${(left / 1000).toFixed(1)} s`;
       } else if (c.phase === "hide") {
         const left = Math.max(0, c.phaseEndsAt - t);
-        frac = left / 5000;
-        label = `live ${(left / 1000).toFixed(1)} s`;
+        frac = Math.min(1, left / 5000);
+        label = left > 0 ? `live in ${(left / 1000).toFixed(1)} s` : "going live…";
       } else if (c.phase === "lights") {
         const left = Math.max(0, c.phaseEndsAt - t);
-        frac = left / 8000;
-        label = `next ${Math.ceil(left / 1000)} s`;
-      }
+        frac = Math.min(1, left / 8000);
+        label = `next round ${Math.ceil(left / 1000)} s`;
+      } else label = "connecting…";
       if (arc.current) arc.current.setAttribute("stroke-dashoffset", (62.8 * (1 - frac)).toFixed(1));
       if (txt.current && txt.current.textContent !== label) txt.current.textContent = label;
       raf = requestAnimationFrame(loop);
@@ -59,7 +62,7 @@ function Status() {
   const reveal = useGame((s) => s.reveal);
   const pct = Math.round(bellChance * 100);
   const clock =
-    phase === "hide" ? "0:00 · HIDE" : phase === "lights" ? `${mmss(5 + (reveal?.bellBeat ?? beat) * 1.5)} · bell` : `${mmss(5 + (beat - 1) * 1.5)} · beat ${beat}`;
+    phase === "connecting" ? "–:–– · joining" : phase === "hide" ? "0:00 · HIDE" : phase === "lights" ? `${mmss(5 + (reveal?.bellBeat ?? beat) * 1.5)} · bell` : `${mmss(5 + (beat - 1) * 1.5)} · beat ${beat}`;
   return (
     <div className="status">
       <div>
@@ -69,7 +72,7 @@ function Status() {
         <div className="clock mono" data-testid="clock">{clock}</div>
       </div>
       <div className={"bell" + (pct > 0 ? " hot" : "")} title="The closing auction ends after a VRF-drawn live beat between 20 and 29">
-        <span className="what">🔔 bell after beat 20–29 (secret)</span>
+        <span className="what">🔔 bell: secret beat 20–29</span>
         <span>chance this beat <b className="mono">{pct}%</b></span>
         <span className="meter"><i style={{ width: `${pct}%` }} /></span>
       </div>
@@ -88,43 +91,88 @@ function Status() {
   );
 }
 
-function Banners() {
-  const notice = useGame((s) => s.joinNotice);
+/** The join notice stays up for this many live beats after it is first seen, then goes away on its own. */
+const NOTICE_BEATS = 2;
+
+/** One notice line under the status strip: join notice, spectator offer, or the phase hint. */
+function Notice() {
   const canJoin = useGame((s) => s.canJoin);
   const phase = useGame((s) => s.clock.phase);
-  const placed = useGame((s) => s.me?.level);
+  const beat = useGame((s) => s.clock.beat);
+  const round = useGame((s) => s.table.round);
+  const mySeat = useGame((s) => s.table.mySeat);
+  const name = useGame((s) => (s.table.mySeat !== null ? s.table.seats[s.table.mySeat]?.name : undefined));
+  const seated = useGame((s) => s.me !== null && s.table.mySeat !== null);
+  const me = useGame(useShallow((s) => (s.me ? { level: s.me.level, resting: s.me.resting } : null)));
   const bellBeat = useGame((s) => s.reveal?.bellBeat);
-  const [dismissed, setDismissed] = useState<string | null>(null);
-  const key = notice ? `${notice.name}:${notice.level}` : null;
-  return (
-    <>
-      {notice && dismissed !== key && (
-        <div className="join" data-testid="join">
-          <span>
-            You're in: <b>{notice.name}</b>, desk {notice.seat + 1} of 8, free chips, no wallet. Your {lots(notice.resting)} lots rest dark at{" "}
-            <b>{priceOf(notice.level)}</b>. Your algo is already pinging: click any price to ping it yourself.
-          </span>
-          <button className="go" onClick={() => { unlockAudio(); setDismissed(key); }}>
-            GOT IT
-          </button>
-        </div>
-      )}
-      {canJoin && (
-        <div className="join">
-          <span>You're watching this pool. Take a desk: free chips, no wallet, you take over a house bot's order as it stands.</span>
-          <button className="go" onClick={() => { unlockAudio(); actions().join(); }}>
-            TAKE A DESK
-          </button>
-        </div>
-      )}
-      {phase === "hide" && (
-        <div className="phase hide">
-          HIDE · click a price to rest your 10 lots there{placed ? ` · now at ${priceOf(placed)}` : ""} · not placed by the start = a random level
-        </div>
-      )}
-      {phase === "lights" && <div className="phase lights">🔔 CLOSING BELL{bellBeat ? ` · beat ${bellBeat}` : ""} · LIGHTS ON</div>}
-    </>
-  );
+  // "You're in": announced each time this browser gets a desk, from the live view (not a snapshot),
+  // hidden during the bell, gone after NOTICE_BEATS live beats or on GOT IT
+  const [announce, setAnnounce] = useState<{ seat: number; until: { round: number; beat: number } | null } | null>(null);
+  useEffect(() => {
+    if (!seated || mySeat === null) {
+      if (announce) setAnnounce(null);
+      return;
+    }
+    if (!announce || (announce.seat !== mySeat && announce.seat !== -1 - mySeat)) {
+      setAnnounce({ seat: mySeat, until: null });
+      return;
+    }
+    if (announce.seat < 0 || phase !== "live") return;
+    if (!announce.until) setAnnounce({ seat: mySeat, until: { round, beat: beat + NOTICE_BEATS - 1 } });
+    else if (round !== announce.until.round || beat > announce.until.beat) setAnnounce({ seat: -1 - mySeat, until: null });
+  }, [seated, mySeat, phase, beat, round, announce]);
+  const showJoin = !!announce && announce.seat >= 0 && phase !== "lights" && phase !== "connecting";
+  const dismiss = () => mySeat !== null && setAnnounce({ seat: -1 - mySeat, until: null });
+
+  let body: React.ReactNode = null;
+  let kind = "hint";
+  if (canJoin) {
+    kind = "join";
+    body = (
+      <>
+        <span>You're watching. <b>Take a desk</b>: free chips, no wallet, you take over a house bot's order as it stands.</span>
+        <button className="go" data-testid="takedesk" onClick={() => { unlockAudio(); actions().join(); }}>
+          TAKE A DESK
+        </button>
+      </>
+    );
+  } else if (showJoin) {
+    kind = "join";
+    const placed = me && me.level > 0;
+    body = (
+      <>
+        <span data-testid="join">
+          You're in{name ? <>: <b>{name}</b></> : null}, desk {mySeat! + 1} of 8 · free chips, no wallet.{" "}
+          {placed && me!.resting > 0 ? (
+            <>Your {lots(me!.resting)} lots rest dark at <b>{priceOf(me!.level)}</b>. </>
+          ) : null}
+          {phase === "hide" ? "Click a price to hide your order." : "Your algo pings for you: click any price to ping it yourself."}
+        </span>
+        <button className="go" onClick={() => { unlockAudio(); dismiss(); }}>
+          GOT IT
+        </button>
+      </>
+    );
+  } else if (phase === "hide") {
+    kind = "hide";
+    body = (
+      <span>
+        <b>HIDE</b> · click a price to rest your 10 lots there{me?.level ? <> · now at <b>{priceOf(me.level)}</b></> : null} · not placed = a random level
+      </span>
+    );
+  } else if (phase === "lights") {
+    kind = "lights";
+    body = <span>🔔 CLOSING BELL{bellBeat ? ` · beat ${bellBeat}` : ""} · LIGHTS ON · the whole book replays</span>;
+  } else if (phase === "live" && me) {
+    body = (
+      <span>
+        <b>LIVE</b> · click a price to ping it · <b className="g">FILL</b>: ping it again · <b className="r">PICKED OFF</b>: re-quote
+      </span>
+    );
+  } else if (!me && mySeat === null && phase !== "connecting") {
+    body = <span><b>Watching</b> · a desk is on its way to you · every desk pings one price per beat; orders stay dark until the bell</span>;
+  } else body = <span>{phase === "connecting" ? "connecting to the pool…" : "opening your desk…"}</span>;
+  return <div className={"notice " + kind}>{body}</div>;
 }
 
 /* ------------------------------------------------------------------ ladder */
@@ -350,19 +398,23 @@ function Ladder() {
             "rung" +
             (L === MID ? " mid" : "") +
             (mine ? " mine" : "") +
-            (live && selected === L && !mine ? " sel" : "") +
+            ((live || (phase === "hide" && !!me)) && selected === L && !mine ? " sel" : "") +
             (mark && !queuedPing && !dest ? " " + mark : "") +
             (isAlgo && !mark ? " algonext" : "") +
             (queuedPing ? " queued" : "") +
             (dest ? " dest" : "");
           const here = finalLevels && litStage === 2 ? finalLevels.map((lv, d) => (lv === L ? d : -1)).filter((d) => d >= 0) : [];
           return (
-            <div key={L} className={cls} ref={(el) => { rungs.current[L - 1] = el; }} onClick={() => onRung(L)} data-level={L}>
+            <div key={L} className={cls} ref={(el) => { rungs.current[L - 1] = el; }} onClick={() => onRung(L)} data-level={L} role="button" aria-label={`price ${priceOf(L)}${label ? ` · ${label}` : ""}`}>
               <div className="px">{priceOf(L)}</div>
               <div className="depth">
                 {mine && !here.length && (
                   <div className="order" ref={chip}>
-                    YOUR ORDER <span className="lots">{lots(me!.resting)}</span> lots · dark
+                    {me!.resting > 0 ? (
+                      <>YOUR ORDER <span className="lots">{lots(me!.resting)}</span> lots · dark</>
+                    ) : (
+                      <>YOUR ORDER · all picked off</>
+                    )}
                   </div>
                 )}
                 {here.map((d, k) => {
@@ -417,7 +469,8 @@ function ActionBar() {
       <button
         className={"btn ping" + (pend?.kind === "ping" ? " on" : "")}
         disabled={!live}
-        onClick={() => {
+        onClick={(e) => {
+          if (e.detail > 0) e.currentTarget.blur();
           unlockAudio();
           useUi.setState({ interacted: true });
           actions().ping(selected);
@@ -431,7 +484,8 @@ function ActionBar() {
         className={"btn move" + (moveMode ? " on" : "") + (pulse ? " pulse" : "")}
         disabled={!live}
         title="Click, then click a price. Press twice: re-quote to a random untested level."
-        onClick={() => {
+        onClick={(e) => {
+          if (e.detail > 0) e.currentTarget.blur();
           unlockAudio();
           useUi.setState({ interacted: true });
           if (moveMode) {
@@ -441,7 +495,7 @@ function ActionBar() {
           } else useUi.setState({ moveMode: true });
         }}
       >
-        RE-QUOTE (move)
+        RE-QUOTE
       </button>
       <div className="algo">
         {!me ? (
@@ -468,9 +522,9 @@ function Keys() {
   const beatTick = useUi((s) => s.beatTick);
   return (
     <span className="keys">
-      Space ping last FILL · R re-quote · ↑↓ Enter ·{" "}
-      <button className="close" onClick={() => useUi.setState({ beatTick: !beatTick })}>
-        beat tick {beatTick ? "on" : "off"}
+      <kbd>Space</kbd> re-ping FILL · <kbd>R</kbd> re-quote · <kbd>↑</kbd><kbd>↓</kbd><kbd>Enter</kbd> ping ·{" "}
+      <button className="linkbtn" aria-pressed={beatTick} title="quiet tick on every beat" onClick={() => useUi.setState({ beatTick: !beatTick })}>
+        tick {beatTick ? "on" : "off"}
       </button>
     </span>
   );
@@ -480,6 +534,8 @@ function useKeys() {
   useEffect(() => {
     const on = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement || e.metaKey || e.ctrlKey || e.altKey) return;
+      const onControl = e.target instanceof HTMLButtonElement || e.target instanceof HTMLAnchorElement;
+      if (onControl && (e.key === " " || e.key === "Enter")) return; // the focused control handles it
       const ui = useUi.getState();
       if (e.key === "Escape") {
         useUi.setState({ peekOpen: false, moveMode: false });
@@ -487,7 +543,20 @@ function useKeys() {
       }
       if (ui.peekOpen) return;
       const { me, clock } = useGame.getState();
-      if (!me || clock.phase !== "live") return;
+      if (!me) return;
+      if (clock.phase === "hide") {
+        if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+          e.preventDefault();
+          const d = e.key === "ArrowUp" ? -1 : 1;
+          useUi.setState({ selected: Math.min(LEVELS, Math.max(1, ui.selected + d)) });
+        } else if (e.key === "Enter") {
+          unlockAudio();
+          actions().place(ui.selected);
+          sfx.requote();
+        }
+        return;
+      }
+      if (clock.phase !== "live") return;
       const a = actions();
       const ping = (L: number) => {
         unlockAudio();
@@ -522,13 +591,13 @@ export function Pool() {
   return (
     <section className="panel pool" data-testid="pool">
       <Status />
-      <Banners />
+      <Notice />
       <Ladder />
       <div className="legend">
-        <span><i style={{ background: "var(--you)" }} />your hidden order (only you see it)</span>
-        <span><i style={{ background: "var(--gold)" }} />your FILL: size rests here</span>
-        <span><i style={{ background: "#4b5670" }} />your miss (it was empty then)</span>
-        <span><i style={{ background: "var(--sonar)" }} />your algo's next ping</span>
+        <span><i style={{ background: "var(--you)" }} />your hidden order</span>
+        <span><i style={{ background: "var(--gold)" }} />FILL</span>
+        <span><i style={{ background: "#5b6680" }} />miss</span>
+        <span><i style={{ background: "var(--sonar)" }} />algo's next ping</span>
         <Keys />
       </div>
       <ActionBar />

@@ -10,6 +10,7 @@ export function Ticker() {
     <div className="ticker" data-testid="ticker">
       <div className="lab">TAPE</div>
       <div className="stream">
+        {prints.length === 0 && <span className="idle">prints land here every beat: who filled, how much, price withheld</span>}
         {prints.map((p, k) => (
           <span key={p.id} className={k === 0 ? "new" : ""}>
             {mmss(p.t)}{" "}

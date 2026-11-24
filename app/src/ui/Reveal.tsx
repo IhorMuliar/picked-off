@@ -159,7 +159,7 @@ export function Reveal() {
             <div className="fadein">
               <div className="reveal-grid">
                 {r.totals.map((v, d) => (
-                  <div key={d} className={(d === top ? "win" : "") + (d === mySeat ? " me" : "")}>
+                  <div key={d} className={(d === top ? "win" : "") + (d === mySeat ? " you" : "")}>
                     {d === mySeat ? "YOU" : seats[d]?.name}
                     <br />
                     <b>{lots(v)}</b>

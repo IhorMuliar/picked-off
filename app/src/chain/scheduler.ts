@@ -6,6 +6,12 @@
  * `leadMs` before its deadline. A send carries the player's latest choice for that beat, or
  * a no-op. `seq` is strictly increasing and starts above the floor read from `Desk.last_seq`.
  * Every send gets 16 fresh random salt bytes.
+ *
+ * The schedule extrapolates at most one beat past the deadline of the plan it was given: a
+ * send that would leave after the last send slot of the following beat is not made, the
+ * choice is dropped, and sending resumes only when a plan with a newer deadline arrives (the
+ * main thread posts one per beat). A tab that stops reading the Table (asleep, offline, or
+ * past the bell before it has seen it) therefore stops within one beat.
  */
 export type PlanPhase = "off" | "hide" | "live";
 export interface Plan {
@@ -58,6 +64,9 @@ export class ActScheduler {
   private intervals: number[] = [];
   private sentTimes: number[] = [];
   private sentCount = 0;
+  /** the run of sending was interrupted (stale plan): the next interval is not a cadence sample */
+  private broken = false;
+  private stalls = 0;
 
   constructor(private d: SchedulerDeps) {
     this.intervalMs = d.intervalMs ?? 250;
@@ -85,7 +94,26 @@ export class ActScheduler {
       return;
     }
     const next = this.nextSendTime();
+    if (!this.fresh(next)) return this.stall();
     if (this.armedAt === null || Math.abs(next - this.armedAt) > 5) this.arm(next);
+  }
+
+  /** Latest time a send may leave on the current plan: the last send slot of the beat after its deadline. */
+  get sendLimit(): number {
+    return this.plan.deadline + this.plan.beatMs - this.leadMs + 1;
+  }
+  private fresh(at: number) {
+    return this.plan.phase !== "off" && at <= this.sendLimit;
+  }
+  /** Stop on a stale plan: no timer, no carried choice; the next fresh plan restarts sending. */
+  private stall() {
+    if (this.timer !== null || this.choice !== null) this.stalls++;
+    this.disarm();
+    this.choice = null;
+    this.broken = true;
+  }
+  get stalled() {
+    return this.stalls;
   }
 
   /** Deadline of the beat a send (or a choice) at time `t` belongs to. */
@@ -128,23 +156,27 @@ export class ActScheduler {
     this.armedAt = null;
     if (this.plan.phase === "off") return;
     const at = this.d.now();
+    if (!this.fresh(at)) return this.stall(); // a late timer on a plan more than one beat old
     const deadline = this.beatOf(at);
     const c = this.choice && Math.abs(this.choice.target - deadline) < this.plan.beatMs / 2 ? this.choice : null;
     if (this.choice && this.choice.target < deadline - this.plan.beatMs / 2) this.choice = null; // its beat is over
     this.seq = (this.seq + 1) >>> 0;
     const job: SendJob = { seq: this.seq, kind: c?.kind ?? 0, level: c?.level ?? 0, salt: this.d.random(16), at, deadline };
-    if (this.lastSent !== null) {
+    if (this.lastSent !== null && !this.broken) {
       this.intervals.push(at - this.lastSent);
       if (this.intervals.length > 240) this.intervals.shift();
     }
     this.lastSent = at;
+    this.broken = false;
     this.sentCount++;
     this.sentTimes.push(at);
     while (this.sentTimes.length && this.sentTimes[0] < at - 60_000) this.sentTimes.shift();
     try {
       this.d.send(job);
     } finally {
-      this.arm(this.nextSendTime());
+      const next = this.nextSendTime();
+      if (this.fresh(next)) this.arm(next);
+      else this.stall();
     }
   }
 

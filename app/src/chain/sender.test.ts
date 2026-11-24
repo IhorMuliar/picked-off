@@ -79,7 +79,11 @@ describe("constant-rate scheduler", () => {
     const s = make(jobs);
     const deadline = Date.now() + 1500;
     s.setPlan({ phase: "live", deadline, beatMs: 1500 });
-    vi.advanceTimersByTime(60_000);
+    // the main thread posts the next deadline ~100 ms after each beat closes
+    for (let b = 0; b < 40; b++) {
+      vi.advanceTimersByTime(1500);
+      s.setPlan({ phase: "live", deadline: deadline + (b + 1) * 1500, beatMs: 1500 });
+    }
     expect(jobs.length).toBeGreaterThanOrEqual(239);
     expect(jobs.length).toBeLessThanOrEqual(241);
     for (let i = 1; i < jobs.length; i++) expect(jobs[i].at - jobs[i - 1].at).toBe(250);
@@ -171,12 +175,103 @@ describe("constant-rate scheduler", () => {
     s.setPlan({ phase: "live", deadline: d, beatMs: 1500 });
     for (let i = 0; i < 40; i++) {
       vi.advanceTimersByTime(250);
+      if (Date.now() > d + 100) d += 1500; // the next beat's deadline
       d += i % 2 ? 2 : -2; // slot-clock jitter
       s.setPlan({ phase: "live", deadline: d, beatMs: 1500 });
     }
     const gaps = jobs.slice(1).map((j, i) => j.at - jobs[i].at);
     expect(Math.min(...gaps)).toBeGreaterThanOrEqual(125);
     expect(Math.max(...gaps)).toBeLessThanOrEqual(375);
+  });
+});
+
+describe("scheduler stops on a stale plan (bell, sleeping tab, lost Table feed)", () => {
+  beforeEach(() => vi.useFakeTimers({ now: 2_000_000 }));
+  afterEach(() => vi.useRealTimers());
+  const make = (jobs: SendJob[]) =>
+    new ActScheduler({
+      now: () => Date.now(),
+      setTimer: (fn, ms) => setTimeout(fn, ms),
+      clearTimer: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
+      random: (n) => nacl.randomBytes(n),
+      send: (j) => jobs.push(j),
+    });
+
+  it("extrapolates at most one beat past the plan's deadline, then stops by itself", () => {
+    const jobs: SendJob[] = [];
+    const s = make(jobs);
+    const deadline = Date.now() + 1500;
+    s.setPlan({ phase: "live", deadline, beatMs: 1500 });
+    vi.advanceTimersByTime(30_000); // no fresh plan ever arrives (e.g. the bell was never read)
+    expect(jobs.length).toBe(12); // 6 sends in the planned beat + 6 in the next one
+    expect(Math.max(...jobs.map((j) => j.at))).toBe(deadline + 1500 - 200);
+    expect(jobs.every((j) => j.at <= s.sendLimit)).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("resumes only on a plan with a newer deadline; a re-post of the stale plan does not restart it", () => {
+    const jobs: SendJob[] = [];
+    const s = make(jobs);
+    const deadline = Date.now() + 1500;
+    const plan = { phase: "live" as const, deadline, beatMs: 1500 };
+    s.setPlan(plan);
+    vi.advanceTimersByTime(10_000);
+    const n = jobs.length;
+    s.setPlan(plan);
+    vi.advanceTimersByTime(5_000);
+    expect(jobs.length).toBe(n);
+    const fresh = Date.now() + 1200;
+    s.setPlan({ phase: "live", deadline: fresh, beatMs: 1500 });
+    vi.advanceTimersByTime(1000);
+    expect(jobs.length).toBe(n + 5); // +0, 250, 500, 750, 1000 ms on the new grid
+    // the pause is not a cadence sample
+    expect(s.stats().max).toBe(250);
+  });
+
+  it("a timer that fires late (throttled tab) past the limit sends nothing", () => {
+    const jobs: SendJob[] = [];
+    const s = make(jobs);
+    const deadline = Date.now() + 1500;
+    s.setPlan({ phase: "live", deadline, beatMs: 1500 });
+    vi.advanceTimersByTime(1000);
+    const n = jobs.length;
+    vi.setSystemTime(Date.now() + 10_000); // the tab slept: the clock moved, the timer did not run
+    vi.runOnlyPendingTimers();
+    expect(jobs.length).toBe(n);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("drops the player's choice on a stall: it never carries into the next round's HIDE", () => {
+    const jobs: SendJob[] = [];
+    const s = make(jobs);
+    const deadline = Date.now() + 1500;
+    s.setPlan({ phase: "live", deadline, beatMs: 1500 });
+    vi.advanceTimersByTime(1400); // past the beat's last send: the choice targets the next beat
+    s.choose(2, 7);
+    vi.advanceTimersByTime(20_000);
+    expect(s.currentChoice).toBeNull();
+    const before = jobs.length;
+    s.setPlan({ phase: "hide", deadline: Date.now() + 5000, beatMs: 1500 });
+    vi.advanceTimersByTime(4000);
+    const hide = jobs.slice(before);
+    expect(hide.length).toBe(16);
+    expect(hide.every((j) => j.kind === 0 && j.level === 0)).toBe(true);
+  });
+
+  it("the off plan at the bell clears the choice; nothing is sent until a fresh plan", () => {
+    const jobs: SendJob[] = [];
+    const s = make(jobs);
+    s.setPlan({ phase: "live", deadline: Date.now() + 1500, beatMs: 1500 });
+    vi.advanceTimersByTime(300);
+    s.choose(1, 4);
+    const n = jobs.length;
+    s.setPlan({ phase: "off", deadline: 0, beatMs: 1500 });
+    expect(s.currentChoice).toBeNull();
+    vi.advanceTimersByTime(8000);
+    expect(jobs.length).toBe(n);
+    s.setPlan({ phase: "hide", deadline: Date.now() + 5000, beatMs: 1500 });
+    vi.advanceTimersByTime(2000);
+    expect(jobs.slice(n).every((j) => j.kind === 0)).toBe(true);
   });
 });
 

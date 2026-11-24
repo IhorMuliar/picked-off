@@ -68,12 +68,12 @@ function Tape() {
   else if (clock.phase === "hide") right = "calls open";
   else if (open) {
     const n = tape.closeBeat - clock.beat + 1;
-    right = `calls close in ${n} beat${n === 1 ? "" : "s"}`;
+    right = `closes in ${n} beat${n === 1 ? "" : "s"}`;
   } else right = "calls closed";
   return (
     <section className="panel tape" data-testid="tape">
       <div className="ph">
-        <span>The Tape · Top Desk at the bell</span>
+        <span>The Tape · call the Top Desk</span>
         <span className="mono">{right}</span>
       </div>
       {seats.map((s, i) => (

@@ -20,13 +20,14 @@ export function Header() {
       <div className="hook">Hide your order in the dark book. Ping to pick off theirs.</div>
       <div className="spacer" />
       <div className="number mono" title={title} data-testid="number">
+        <span className="lbl">beat → private result </span>
         {latency.p95 === null || latency.n < MIN_SAMPLES ? (
           <>
-            beat → private result <b>measuring…</b> n={latency.n}
+            <b className="val pending">measuring</b> <span className="n">{Math.min(latency.n, MIN_SAMPLES)}/{MIN_SAMPLES} beats</span>
           </>
         ) : (
           <>
-            beat → private result <b>{Math.round(latency.p95)} ms</b> p95 · n={latency.n.toLocaleString("en-US")}
+            <b className="val">{Math.round(latency.p95)} ms</b> <span className="n">p95 · n={latency.n.toLocaleString("en-US")}</span>
           </>
         )}
       </div>
@@ -38,9 +39,9 @@ export function Header() {
           useUi.setState({ peekOpen: true });
         }}
       >
-        🔒 Try to peek
+        🔒 <span className="lbl">Try to </span>peek
       </button>
-      <button className="chip" data-testid="mute" aria-pressed={muted} onClick={() => setMuted(!muted)}>
+      <button className="chip" data-testid="mute" aria-pressed={muted} aria-label="mute" onClick={() => setMuted(!muted)}>
         {muted ? "🔇 off" : "🔊 on"}
       </button>
     </header>

@@ -47,6 +47,8 @@ const pct = (xs: number[], p: number) => {
 };
 
 export interface ChainStatus {
+  /** acts this browser sent after the bell's deadline, per finished round (oldest first, last 20) */
+  actsAfterBell: { round: string; n: number }[];
   cluster: string;
   burner: string;
   link: string;
@@ -137,6 +139,11 @@ class ChainDriver implements GameDriver {
   private ackedSeq = 0;
   private cadence: CadenceStats | null = null;
   private sendFailed = 0;
+  /** epoch ms of this round's bell deadline once the bell is read, and acts sent after it */
+  private bellCloseAt: number | null = null;
+  private afterBell = 0;
+  private recentSends: number[] = [];
+  private afterBellLog: { round: string; n: number }[] = [];
   private seqSavedAt = 0;
 
   private config: Config | null = null;
@@ -375,6 +382,13 @@ class ChainDriver implements GameDriver {
 
     // bell / lights
     if (t.phase >= PHASE.bell && this.bellAt === null) this.bellAt = now();
+    if (t.phase >= PHASE.bell && this.bellCloseAt === null) {
+      this.bellCloseAt = toEpoch(this.timeOf(t.hideEndSlot + BigInt(t.beat) * t.beatSlots));
+      this.afterBell = this.recentSends.filter((at) => at > this.bellCloseAt!).length;
+      // no choice carries past the bell (the plan goes off below; this also clears the shown pending action)
+      this.post({ type: "clear" });
+      if (this.myDesk && this.myDesk.pending.kind !== "none") this.setMe({ pending: { kind: "none" } });
+    }
     if (t.phase === PHASE.revealed && this.revealRound !== t.round) void this.loadReveal(t);
 
     // public beat results
@@ -392,7 +406,8 @@ class ChainDriver implements GameDriver {
         ...s.table, pool: String(t.tableId).padStart(4, "0"), round: Number(t.round), seats: seatsView(t), mySeat: this.released ? null : this.seat,
         lastPings: counts[0], lastFills: counts[1], source: this.cfg.cluster,
       },
-      canJoin: (this.seat === null || this.released) && t.kind === TABLE_KIND.house,
+      // no "take a desk" offer while a join is already in flight or queued for the next free desk
+      canJoin: (this.released || (this.seat === null && !this.joining && !this.waitingSeat)) && t.kind === TABLE_KIND.house,
       clock: this.clockOf(t),
     }));
     this.updatePlan();
@@ -407,7 +422,8 @@ class ChainDriver implements GameDriver {
     const phase: Phase =
       t.phase === PHASE.hide ? "hide" : t.phase === PHASE.live ? "live" : t.phase >= PHASE.bell ? "lights" : "connecting";
     const beat = phase === "live" ? t.beat + 1 : phase === "lights" ? t.beat : 0;
-    const liveStartedAt = this.timeOf(t.hideEndSlot);
+    // in HIDE the program has not set hide_end_slot yet (0): the HIDE deadline is next_deadline_slot
+    const liveStartedAt = this.timeOf(t.phase === PHASE.hide ? t.nextDeadlineSlot : t.hideEndSlot);
     return {
       phase,
       beat,
@@ -419,6 +435,13 @@ class ChainDriver implements GameDriver {
   }
 
   private newRound(t: Table, first: boolean) {
+    if (this.bellCloseAt !== null && this.round !== null) {
+      this.afterBellLog.push({ round: this.round.toString(), n: this.afterBell });
+      if (this.afterBellLog.length > 20) this.afterBellLog.shift();
+    }
+    this.bellCloseAt = null;
+    this.afterBell = 0;
+    this.recentSends = [];
     this.round = t.round;
     if (!first && this.seat !== null && !this.released && !this.keepSeat && this.seatedRound !== null && t.round - this.seatedRound >= 2n) {
       // nobody touched this desk for a whole round: stop acting so the house can give the seat back to a bot
@@ -637,6 +660,11 @@ class ChainDriver implements GameDriver {
     if (m.type === "sent") {
       const r = m.r;
       this.lastSentSeq = r.seq;
+      if (this.bellCloseAt !== null && r.at > this.bellCloseAt) this.afterBell++;
+      else if (this.bellCloseAt === null) {
+        this.recentSends.push(r.at);
+        if (this.recentSends.length > 40) this.recentSends.shift();
+      }
       if (r.ok) {
         this.lastActSig = r.signature;
         this.sentAt.set(r.seq, r.at);
@@ -869,7 +897,7 @@ class ChainDriver implements GameDriver {
         const call = d && isAccount(d.data, "Call") ? decodeCall(d.data) : null;
         if (!call) {
           this.pendingClaims.delete(id);
-          this.flash(`Tape call on round ${p.n} settled and paid`);
+          this.flash(`Tape call on round ${p.n} settled`);
           continue;
         }
         if (call.claimed || call.owed > 0n) {
@@ -1047,6 +1075,7 @@ class ChainDriver implements GameDriver {
     const ws: ChainStatus["watches"] = {};
     for (const [k, v] of Object.entries(this.watches)) ws[k] = { ...v.stats };
     return {
+      actsAfterBell: [...this.afterBellLog],
       cluster: this.cfg.cluster,
       burner: this.burner.address,
       link: this.tee.state,

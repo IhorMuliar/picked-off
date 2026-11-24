@@ -4,7 +4,8 @@
 
 A MagicBlock Solana Blitz v10 entry, on Solana devnet and MagicBlock's devnet TEE rollup.
 
-<!-- Screenshot (ladder mid-round) and a short GIF of a FILL and a PICKED OFF go here once they are in the repo. -->
+![Picked Off live on devnet: a FILL mark, your hidden order and the Tape](media/picked-off-live.png)
+![Ping → FILL, then PICKED OFF](media/picked-off-fill.gif)
 
 ## How to play
 
