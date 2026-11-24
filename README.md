@@ -1,5 +1,5 @@
 **PICKED OFF: a 50-second dark pool. Hide your order, ping for everyone else's, pick them off before the closing bell. Only MagicBlock's TEE knows where anyone is.**  
-▶ **Play, no wallet: https://picked-off-smoky.vercel.app** · beat → private result **111 ms p95** (n = 74 beats, EU browser, 2026-11-24)  
+▶ **Play, no wallet: https://picked-off-smoky.vercel.app** · beat → private result **94 ms p95** (n = 354 beats, 10 fresh browser tabs, EU, 2026-11-24)  
 <!-- 60-s video: <VIDEO LINK> -->
 
 A MagicBlock Solana Blitz v10 entry, on Solana devnet and MagicBlock's devnet TEE rollup.
@@ -62,21 +62,21 @@ In the game, **🔒 Try to peek** runs five of these reads live from your browse
 
 - **Zero rake.** Chips are conserved: every lot a desk loses, another desk picked off. Free house pools pay chips, no value.
 - **The Tape**: parimutuel on "Top Desk at the bell" for rounds with a human seated; one 0.01-devnet-SOL call per burner, closes after live beat 10, settled on Solana from the committed round, refunded if nobody called the winner. Callers get devnet SOL from a capped drip ([`drip.ts`](app/api/drip.ts)).
-- An **open odds** board (simulated, labelled so). Staked tables are not built.
+- Staked tables are not built.
 
-## Skill, simulated
+## Skill: model and live
 
-From the game's balance model: 4,000 simulated rounds per cell, payout in stakes, everyone reacting like a typical human unless named. Model numbers, not live play.
+Payout in stakes (1.00 = you keep your 10 lots). Model: 4,000 simulated rounds per cell. Live: scripted players at a house pool on devnet, 90 rounds each, 2026-11-24 ([`humans.ts`](scripts/humans.ts)).
 
-| Seat-0 strategy | vs house bots | vs 7 attentive humans |
+| Seat-0 behaviour, vs house bots | Model | Live |
 |---|---|---|
-| Re-ping fills, re-quote when picked off | 1.34 | 1.21 |
-| Same, present on half the beats | 0.97 | 0.85 |
-| Best strategy using only public information | 0.75 | 0.75 |
-| Never click (algo only) | 0.44 | 0.42 |
-| Script reading results at machine speed | 1.40 | 1.27 |
+| Re-ping fills, re-quote when picked off | 1.34 | 1.56 |
+| Same, present on half the beats | 0.97 | 1.24 |
+| Best play using only public information | 0.75 | not run |
+| Random pings, never move | 0.44 | 0.58 |
+| Script reading results at machine speed | 1.40 | 1.70 |
 
-At a 1.5-s beat a machine-speed reader gains only 0.03-0.07 stakes over a typical human in this model.
+Information beats random by about one stake, live as in the model. A machine-speed reader gains 0.03-0.07 stakes over a typical human in the model; live it gained 0.14 ± 0.14, too few rounds to separate the two.
 
 ## Nearest past entries
 
@@ -111,7 +111,7 @@ flowchart LR
 ## Verify it yourself
 
 - Base layer: the [program on Solana Explorer](https://explorer.solana.com/address/5eP2A36T97mwaGHf6XoHZU6VoKh1NGxA2QwvtJhAJ6ms?cluster=devnet) shows per recorded round a delegation, the validator's commit, `settle_round` and `close_round`. Play itself never touches the base layer.
-- Rollup: [house pool 1's Table on the TEE](https://explorer.solana.com/address/C9F937UM7d254jBMp1kNh1MnpSRcw6TcP2GkBUiXxq27?cluster=custom&customUrl=https%3A%2F%2Fdevnet-tee.magicblock.app) (explorer custom cluster `https://devnet-tee.magicblock.app`). Between a bell and the next re-seal its ticks and acts are readable in full; during play they are not.
+- Rollup: [house pool 1's Table on the TEE](https://explorer.solana.com/address/C9F937UM7d254jBMp1kNh1MnpSRcw6TcP2GkBUiXxq27?cluster=custom&customUrl=https%3A%2F%2Fdevnet-tee.magicblock.app). Between a bell and the next re-seal its ticks and acts are readable in full; during play they are not.
 - After each bell the game prints "replay ✓ … matches commit": the browser re-runs the revealed log from the seed ([`replay.ts`](app/src/core/replay.ts)).
 
 Measured on devnet, 2026-11-24 (program version 1, TEE validator in Singapore):
@@ -120,10 +120,11 @@ Measured on devnet, 2026-11-24 (program version 1, TEE validator in Singapore):
 |---|---|
 | Beat timing | 430 live beats over 18 rounds: 418 resolved on the deadline slot, 12 one slot late, none twice |
 | VRF | request → callback 2 slots in 17 of 18 rounds (6 on the first after deploy); no fallback seed |
-| Delegation | usable on the TEE 217-582 ms after base confirmation (20 pool accounts) |
-| Round record | 816-byte Round committed alone 18/18; commit → base p50 1.5 s (1.2-6.3 s) |
-| Failures | 0 of 23,117 acts, 0 of 373 house and bettor txs |
-| Walletless join | link → own Desk on screen: p50 4.3 s, max 5.8 s (27 fresh browsers, EU) |
+| Round record | 384 recorded rounds in a row committed, re-verified, settled and closed on Solana; bell → on Solana p50 2.8 s, max 5.8 s |
+| Round length | open → next open p50 52.8 s (n = 376) |
+| Tape | 22 live rounds, 66 calls: every payout and refund exact to the lamport; 12 refunded |
+| Failures | 0 of 60,212 scripted player acts over 360 rounds |
+| Walletless join | link → own Desk on screen: p50 3.8 s, max 5.1 s, 20/20 incl. 2 at once (fresh browsers, EU) |
 
 ## Build and test
 
@@ -158,8 +159,8 @@ Left open, by design or for lack of time:
 - **Everything is public after the bell**, by design: the whole round's transactions, keys and data, until the next re-seal hides them again. Nothing in it helps the next round.
 - **Seated players know more than spectators** on the Tape, and one person can call from a second burner. In the model, calling with your own exact total is right 44.4% of the time vs 42.5% for the public favourite.
 - **No sybil resistance in free pools.** Anyone can take free seats, and several burners can sit at one pool; each takeover hands over that desk's results so far, like colluding players. In the model, two desks sharing everything gain about 0.03 stakes each.
-- **Bots were tuned in the model, not on humans.** All skill numbers above are simulated.
+- **Bots were tuned in the model, not on humans**, and live they are easier: they miss about 8 % of the beats they mean to act on, so live payouts against them run above the model.
 - **Latency is from one region** (EU). The game shows each visitor their own measured number.
-- **Log streams replay a round once it is public.** A few acts sent in the last half second before a bell land just after it, still private, and a log subscriber receives them when that round is revealed about a second later (seen as 9 deliveries next to another pool's live round). They carry constant CU and no logs, and the round they belong to is over.
+- **Log streams replay a round once it is public.** In 30 minutes on both house pools (68 rounds) no stream delivered a private transaction before its round was revealed; afterwards the `"all"` stream replays some of its acts and ticks. They carry constant CU and no logs.
 
 MIT licence.

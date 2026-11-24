@@ -237,3 +237,21 @@ internal-push:
 browser-check:
 	@test -n "$(URL)" || (echo 'usage: make browser-check URL=https://...' && exit 2)
 	node tests/browser/check.mjs $(URL)
+
+# ---- live devnet measurements on the house pools (scripts/). Raw JSON lines go to F2_OUT.
+#   make e2e-devnet                        watch recorded rounds end to end (PASS = 10 consecutive per pool)
+#   make measure-beat BEAT_POOL=2 BEATS=500    beat -> own private result from a seated Node client
+#   make measure-beat URL=https://...      the same number from fresh browser tabs, one after another
+#   make humans F2_POOLS=1,2 HUMAN_ROUNDS=100 scripted players (rotating behaviours), one desk per pool
+F2_OUT ?= f2-out
+F2_POOLS ?= 1,2
+BEAT_POOL ?= 1
+BEATS  ?= 500
+HUMAN_ROUNDS ?= 20
+.PHONY: e2e-devnet measure-beat humans
+e2e-devnet:
+	OUT_DIR=$(F2_OUT) npx tsx scripts/e2e-devnet.ts --pools $(F2_POOLS) --records 10
+measure-beat:
+	OUT_DIR=$(F2_OUT) npx tsx scripts/measure-beat.ts $(if $(URL),--browser $(URL),--pool $(BEAT_POOL) --beats $(BEATS))
+humans:
+	OUT_DIR=$(F2_OUT) npx tsx scripts/humans.ts --pools $(F2_POOLS) --rounds $(HUMAN_ROUNDS)
