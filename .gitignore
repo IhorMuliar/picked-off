@@ -2,6 +2,7 @@
 target/
 .anchor/
 test-ledger/
+magicblock-test-storage/
 **/dist/
 **/node_modules/
 *.tsbuildinfo
