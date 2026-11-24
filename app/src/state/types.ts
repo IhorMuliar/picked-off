@@ -159,6 +159,8 @@ export interface TapeView {
   myCall: number | null;
   /** Result after the bell: multiple paid on the winner, or "refund". */
   paid?: number | "refund";
+  /** Chain driver: a call or claim needs devnet SOL on this browser's key first. */
+  needsFunding?: boolean;
 }
 
 export interface RevealAction {
