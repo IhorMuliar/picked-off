@@ -1,5 +1,7 @@
-//! Rollup: seat a labelled house bot at desk `seat` of a house pool (empty or bot-held seats only).
-//! House only. The Desk's permission is set to the bot key alone (flags 0).
+//! Rollup: seat a labelled house bot at desk `seat` of a house pool. House only. Any time on an
+//! empty or bot-held seat; on a human's seat only between rounds (phase IDLE, REVEALED or
+//! ABORTED), which is how the house frees a seat whose player has gone (the house decides that
+//! off-chain). The Desk's permission is set to the bot key alone (flags 0).
 use crate::constants::*;
 use crate::errors::PingError;
 use crate::state::*;
@@ -37,7 +39,8 @@ pub fn join_bot(ctx: Context<JoinBot>, seat: u8, key: Pubkey, personality: u8, n
         require_house(&t.house, &ctx.accounts.house.key())?;
         require!(t.kind == TABLE_HOUSE, PingError::BadKind);
         let s = seat as usize;
-        require!(t.seats[s].kind != SEAT_HUMAN, PingError::SeatTaken);
+        let between = t.phase == PH_IDLE || t.phase == PH_REVEALED || t.phase == PH_ABORTED;
+        require!(t.seats[s].kind != SEAT_HUMAN || between, PingError::SeatTaken);
         for i in 0..NDESK {
             require!(i == s || t.seats[i].key != key, PingError::AlreadySeated);
         }

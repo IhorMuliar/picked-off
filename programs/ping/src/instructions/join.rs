@@ -2,12 +2,14 @@
 //! - house pools only (staked tables seat by ticket, never by `join`);
 //! - the seat is empty or held by a house bot, never by a human;
 //! - one desk per key per pool (the key may not already sit at any seat of this table);
-//! - only between live play: phase IDLE, HIDE, REVEALED. A Desk carries its round's results, so
-//!   taking a desk during LIVE/BELL (or after an abort, whose desks stay sealed) would hand the
-//!   newcomer what the previous holder learned this round.
+//! - phase IDLE, HIDE, LIVE or REVEALED. Mid-round the burner takes the desk over as it stands:
+//!   its order, lots and this round's results become the burner's. Refused in BELL (the round is
+//!   decided and waits for the reveal) and ABORTED.
 //! The seat becomes the burner's (kind human, its name), the Desk key is the burner, and the Desk
-//! permission is set to that one member with flags 0 (the previous holder loses read access in
-//! the same transaction). `Desk.last_seq` is kept: the new key continues above it.
+//! permission is set to that one member with flags 0, in the same transaction: from then on the
+//! previous key can neither read the Desk nor act for it (its acts fail the key check and are
+//! no-ops). `Desk.last_seq` is kept: the new key continues above it. Nothing here touches the
+//! Book, so a takeover changes no hidden state and no compute cost of `act` or `tick`.
 use crate::constants::*;
 use crate::errors::PingError;
 use crate::state::*;
@@ -44,7 +46,7 @@ pub fn join(ctx: Context<Join>, seat: u8, name: [u8; 16]) -> Result<()> {
     let (table_id, new_seat) = {
         let mut t = ctx.accounts.table.load_mut()?;
         require!(t.kind == TABLE_HOUSE, PingError::BadKind);
-        require!(t.phase == PH_IDLE || t.phase == PH_HIDE || t.phase == PH_REVEALED, PingError::BadPhase);
+        require!(t.phase == PH_IDLE || t.phase == PH_HIDE || t.phase == PH_LIVE || t.phase == PH_REVEALED, PingError::BadPhase);
         let s = seat as usize;
         require!(t.seats[s].kind == SEAT_EMPTY || t.seats[s].kind == SEAT_BOT, PingError::SeatTaken);
         for i in 0..NDESK {

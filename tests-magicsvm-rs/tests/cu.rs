@@ -64,6 +64,7 @@ fn constant_compute_ticks_and_acts() {
     let other = e.pool(10, None);
     let mut bells_seen = Vec::new();
     let mut seq_extra: u32 = 1_000_000;
+    let mut joined = false;
     // act in IDLE (before the first round): masks, no effect
     for k in 0..4u8 {
         let c = e.act(&mut pool, k as usize, k, 7, rng.salt());
@@ -134,6 +135,22 @@ fn constant_compute_ticks_and_acts() {
                 cu.add(&if resolved { "tick resolve live".to_string() } else { format!("tick noop phase {ph}") }, c);
             }
             beat = u16_at(&e.er(&pool.table), off::table::BEAT);
+            if k == 3 && beat == 6 {
+                // a burner takes desk 5 over mid-LIVE: it reads the Desk, the old key is out
+                let burner = Keypair::new();
+                let ix = e.ix_join(&pool, &burner.pubkey(), 5, None);
+                e.ok(Er, &burner, &[], &[ix], "join in LIVE");
+                assert!(e.can_read(Some(burner.pubkey()), &pool.desks[5]));
+                assert!(!e.can_read(Some(pool.bots[5].pubkey()), &pool.desks[5]));
+                let before = e.er(&pool.desks[5]);
+                let old_key = pool.bots[5].insecure_clone();
+                let c = e.act_raw(&old_key, &pool.desks[5], &pool.book, 1, 3, pool.seq[5] + 100, [3; 16]);
+                cu.add("act", c);
+                assert_eq!(e.er(&pool.desks[5]), before, "old key's act changed the Desk");
+                // from now on desk 5 is driven by the burner, continuing above last_seq
+                pool.bots[5] = burner;
+                joined = true;
+            }
             if std::env::var("PING_CU_TRACE").is_ok() {
                 let t = e.er(&pool.table);
                 let bc = off::table::BEAT_COUNTS + 2 * (beat as usize % 32);
@@ -177,6 +194,7 @@ fn constant_compute_ticks_and_acts() {
         }
         e.unseal_all(&pool);
     }
+    assert!(joined, "mid-LIVE join not exercised");
     println!("bells: {bells_seen:?}\n{}", cu.report());
     assert!(cu.0["tick resolve live"].keys().all(|&c| c < 300_000));
     cu.assert_constant();

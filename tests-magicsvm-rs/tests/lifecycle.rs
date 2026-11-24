@@ -260,11 +260,73 @@ fn join_rules() {
     // join in HIDE: allowed
     let ix = e.ix_join(&pool, &p2.pubkey(), 6, None);
     e.ok(Er, &p2, &[], &[ix], "join in HIDE");
-    // LIVE: refused
+    // LIVE: allowed (takeover as it stands); BELL: refused
     let dl = u64_at(&e.er(&pool.table), off::table::NEXT_DEADLINE);
     e.warp_resolve(&pool, dl);
     let p3 = Keypair::new();
     let ix = e.ix_join(&pool, &p3.pubkey(), 7, None);
-    assert!(e.send(Er, &p3, &[], &[ix]).is_err(), "joined during LIVE");
+    e.ok(Er, &p3, &[], &[ix], "join in LIVE");
+    while e.er(&pool.table)[off::table::PHASE] == LIVE {
+        e.tick(&pool);
+        let d = u64_at(&e.er(&pool.table), off::table::NEXT_DEADLINE);
+        let now = e.slot();
+        if d > now {
+            assert!(e.svm.warp_to_slot(d).iter().all(|r| r.is_ok()));
+        }
+    }
+    assert_eq!(e.er(&pool.table)[off::table::PHASE], BELL);
+    let p4 = Keypair::new();
+    let ix = e.ix_join(&pool, &p4.pubkey(), 0, None);
+    assert!(e.send(Er, &p4, &[], &[ix]).is_err(), "joined during BELL");
     let _ = &mut pool;
 }
+
+/// The house reclaims a human's seat with `join_bot` only between rounds.
+#[test]
+fn join_bot_reclaims_a_human_seat_only_between_rounds() {
+    let mut e = Env::new();
+    let mut rng = Rng(11);
+    let mut pool = e.pool(72, None);
+    let h = e.house.insecure_clone();
+    let human = Keypair::new();
+    let ix = e.ix_join(&pool, &human.pubkey(), 2, None);
+    e.ok(Er, &human, &[], &[ix], "join");
+    let bot = Keypair::new();
+    let try_reclaim = |e: &mut Env, pool: &Pool| {
+        let ix = e.ix_join_bot(pool, 2, &bot.pubkey());
+        e.send(Er, &h, &[], &[ix])
+    };
+    // HIDE, LIVE, BELL: refused
+    e.open(&pool, 1, false);
+    assert!(try_reclaim(&mut e, &pool).is_err(), "reclaimed in HIDE");
+    let d = u64_at(&e.er(&pool.table), off::table::NEXT_DEADLINE);
+    e.warp_resolve(&pool, d);
+    assert!(try_reclaim(&mut e, &pool).is_err(), "reclaimed in LIVE");
+    while e.er(&pool.table)[off::table::PHASE] == LIVE {
+        let d = u64_at(&e.er(&pool.table), off::table::NEXT_DEADLINE);
+        e.warp_resolve(&pool, d);
+    }
+    assert!(try_reclaim(&mut e, &pool).is_err(), "reclaimed in BELL");
+    // REVEALED: allowed; the seat is a bot again and the human's key is out
+    e.reveal(&pool, None);
+    try_reclaim(&mut e, &pool).expect("reclaim in REVEALED");
+    let t = e.er(&pool.table);
+    let seat = off::table::SEATS + 56 * 2;
+    assert_eq!(&t[seat..seat + 32], bot.pubkey().as_ref());
+    assert_eq!(t[seat + 48], 2, "seat kind bot");
+    assert_eq!(&e.er(&pool.desks[2])[off::desk::KEY..off::desk::KEY + 32], bot.pubkey().as_ref());
+    assert!(e.can_read(Some(bot.pubkey()), &pool.desks[2]) && !e.can_read(Some(human.pubkey()), &pool.desks[2]));
+    // a stranger cannot do it
+    let s = Keypair::new();
+    let mut ix = e.ix_join_bot(&pool, 3, &s.pubkey());
+    ix.accounts[0].pubkey = s.pubkey();
+    assert!(e.send(Er, &s, &[], &[ix]).is_err(), "stranger seated a bot");
+    // IDLE (a fresh pool) works too
+    let mut p2 = e.pool(73, None);
+    let ix = e.ix_join(&p2, &human.pubkey(), 5, None);
+    e.ok(Er, &human, &[], &[ix], "join p2");
+    let ix = e.ix_join_bot(&p2, 5, &bot.pubkey());
+    e.ok(Er, &h, &[], &[ix], "reclaim in IDLE");
+    let _ = (&mut pool, &mut p2, &mut rng);
+}
+
