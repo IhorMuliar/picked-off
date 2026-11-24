@@ -57,7 +57,9 @@ else
 fi
 
 echo "Keys (outside the repo, never committed)"
-for f in blitz-ping-devnet.json blitz-ping-localnet.json blitz-ping-programs/ping-keypair.json blitz-ping-programs/ping_spike-keypair.json; do
+keys="blitz-ping-devnet.json blitz-ping-localnet.json blitz-ping-programs/ping-keypair.json"
+[ -d spike ] && keys="$keys blitz-ping-programs/ping_spike-keypair.json"
+for f in $keys; do
   [ -f "$HOME/.config/solana/$f" ] && ok "~/.config/solana/$f" || bad "~/.config/solana/$f missing (create it with solana-keygen new -o ~/.config/solana/$f)"
 done
 

@@ -21,3 +21,9 @@ id.json
 .vscode/
 .idea/
 *.log
+
+# local-only working folders, kept out of this repository
+/HANDOFF.md
+/docs/
+/spike/
+/.git-internal/
