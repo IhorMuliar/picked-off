@@ -1452,6 +1452,7 @@ dependencies = [
  "anchor-lang",
  "bytemuck",
  "ephemeral-rollups-sdk",
+ "ping-core",
  "solana-sha256-hasher 3.1.0",
 ]
 

@@ -19,7 +19,7 @@ HAS_SPIKE  := $(wildcard spike/Cargo.toml)
 SPIKE_ENV  := CARGO_TARGET_DIR=$(CURDIR)/target
 
 .PHONY: all setup doctor build build-ping build-spike idl keys test app deploy-devnet \
-        balance knowledge local-stack local-fund spike-local probe-tee clean-ledger \
+        balance knowledge local-stack local-fund local-check-a1 spike-local probe-tee clean-ledger \
         hooks internal-status internal-commit internal-push
 
 all: build
@@ -104,6 +104,11 @@ local-stack:
 # Fund it after each start.
 local-fund:
 	solana airdrop 100 -k $(LOCAL_WALLET) -u $(LOCAL_RPC)
+
+# Program checks against the running local stack (after local-stack + local-fund): sealing and
+# re-sealing, one recorded round through the crank, cancel, commit of the Round alone, aborts.
+local-check-a1:
+	npx tsx tests/local/a1-check.ts
 
 # ---- spike (local-only prototype, not included in this repository)
 

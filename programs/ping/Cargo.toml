@@ -1,7 +1,7 @@
 [package]
 name = "ping"
 version = "0.1.0"
-description = "Ping: hide a stake on a dark ladder, ping to find theirs (MagicBlock PER)"
+description = "Picked Off (codename Ping): a dark order book on a MagicBlock Private Ephemeral Rollup"
 edition = "2021"
 
 [lib]
@@ -9,7 +9,9 @@ crate-type = ["cdylib", "lib"]
 name = "ping"
 
 [features]
-default = []
+# no-log-ix-name + custom-panic: rollup instructions print nothing (crank and player txs can be
+# observed live with their logs and compute units).
+default = ["custom-panic", "no-log-ix-name"]
 cpi = ["no-entrypoint"]
 no-entrypoint = []
 no-idl = []
@@ -21,9 +23,13 @@ custom-panic = []
 
 [dependencies]
 anchor-lang = "=1.0.2"
-# Pinned: 0.20.x needs validator 2.0 (devnet-us only) and breaks #[vrf]; 0.17.3 runs
-# on devnet-tee and mainnet-tee.
+# Pinned: 0.20.x needs validator 2.0 and breaks #[vrf]; 0.17.3 runs on devnet-tee.
 ephemeral-rollups-sdk = { version = "=0.17.3", features = ["anchor", "access-control", "crank", "vrf"] }
+# fixed-length sha256 (syscall on-chain)
+solana-sha256-hasher = { version = "=3.1.0", features = ["sha2"] }
+bytemuck = { version = "=1.25.2", features = ["derive", "min_const_generics"] }
+# the rules engine; its RoundState lives inside the Book account
+ping-core = { path = "../../crates/ping-core", features = ["bytemuck"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }
