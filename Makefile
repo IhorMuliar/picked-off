@@ -18,8 +18,8 @@ HAS_SPIKE  := $(wildcard spike/Cargo.toml)
 # spike/ is its own Cargo + Anchor workspace (the root workspace excludes it); it shares target/.
 SPIKE_ENV  := CARGO_TARGET_DIR=$(CURDIR)/target
 
-.PHONY: all setup doctor build build-ping build-spike idl keys test app deploy-devnet deploy-spike-devnet \
-        delegate balance knowledge local-stack local-fund spike-local spike-devnet probe-tee clean-ledger \
+.PHONY: all setup doctor build build-ping build-spike idl keys test app deploy-devnet \
+        balance knowledge local-stack local-fund spike-local probe-tee clean-ledger \
         hooks internal-status internal-commit internal-push
 
 all: build
@@ -83,21 +83,10 @@ knowledge:
 	$(call local_only,docs/knowledge)
 	python3 scripts/okf_index.py docs/knowledge rules=Rule
 
-# ---- devnet (needs SOL in $(WALLET); ~1 SOL for ping, ~3 SOL for the prototype, x2 peak while deploying)
+# ---- devnet (needs SOL in $(WALLET): about 2x the program rent at peak while deploying)
 deploy-devnet: build-ping
 	solana program deploy target/deploy/ping.so --program-id target/deploy/ping-keypair.json \
 	  -k $(WALLET) -u $(DEVNET_RPC) --with-compute-unit-price 1000
-
-deploy-spike-devnet:
-	$(call local_only,spike/programs/ping-spike/Cargo.toml)
-	$(MAKE) build-spike
-	solana program deploy target/deploy/ping_spike.so --program-id target/deploy/ping_spike-keypair.json \
-	  -k $(WALLET) -u $(DEVNET_RPC) --with-compute-unit-price 1000
-
-# Devnet setup for the prototype in spike/ (not included in this repository).
-delegate:
-	$(call local_only,spike/scripts/run.ts)
-	SPIKE_ENV=devnet PHASES=setup,er npx tsx spike/scripts/run.ts
 
 balance:
 	solana balance -k $(WALLET) -u $(DEVNET_RPC)
@@ -122,10 +111,6 @@ spike-local:
 	$(call local_only,spike/scripts/run.ts)
 	$(MAKE) local-fund
 	SPIKE_ENV=local npx tsx spike/scripts/run.ts
-
-spike-devnet:
-	$(call local_only,spike/scripts/run.ts)
-	SPIKE_ENV=devnet npx tsx spike/scripts/run.ts
 
 probe-tee:
 	$(call local_only,spike/scripts/probe-tee.ts)
