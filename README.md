@@ -39,6 +39,7 @@ and an `anchor` command run elsewhere can repoint the global Solana install.
 ```sh
 make setup     # npm ci for the root and app/
 make doctor    # check the pinned toolchain (also lists the deploy keypairs it expects)
+make hooks     # install a pre-commit guard that refuses keypair and other secret files
 make build     # build the program with cargo-build-sbf and its IDL with anchor
 make test      # cargo test --workspace
 make app       # production build of the web client into app/dist

@@ -1,5 +1,7 @@
 [workspace]
 members = ["programs/*"]
+# spike/ (local-only, not in this repository) is its own workspace
+exclude = ["spike"]
 resolver = "2"
 
 [profile.release]

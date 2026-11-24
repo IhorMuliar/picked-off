@@ -1454,14 +1454,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ping-spike"
-version = "0.1.0"
-dependencies = [
- "anchor-lang",
- "ephemeral-rollups-sdk",
-]
-
-[[package]]
 name = "pinocchio"
 version = "0.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
