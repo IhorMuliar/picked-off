@@ -1,0 +1,5 @@
+# CLI deploys upload only the web app; the Vercel project's root directory is app/
+/*
+!/app
+/app/node_modules
+/app/dist

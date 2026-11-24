@@ -6,6 +6,7 @@ magicblock-test-storage/
 **/dist/
 **/node_modules/
 *.tsbuildinfo
+.vercel/
 
 # keys: never commit any keypair
 *-keypair.json
@@ -23,8 +24,5 @@ id.json
 .idea/
 *.log
 
-# local-only working folders, kept out of this repository
-/HANDOFF.md
-/docs/
-/spike/
-/.git-internal/
+# Local-only folders sharing this working tree are ignored through .git/info/exclude
+# (`make hooks` writes it), so this file does not hide them from their own repository.
