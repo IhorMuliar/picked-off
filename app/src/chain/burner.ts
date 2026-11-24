@@ -78,6 +78,9 @@ export async function login(endpoint: string, b: Burner, fetchImpl: typeof fetch
   const ch = await fetchImpl(`${endpoint}/auth/challenge?pubkey=${b.address}`);
   const cj = (await ch.json().catch(() => ({}))) as { challenge?: string; error?: string };
   if (!ch.ok || typeof cj.challenge !== "string" || !cj.challenge) throw new AuthError(`challenge failed: ${cj.error ?? ch.status}`, ch.status);
+  // Sign only short printable text. A serialized transaction message starts with a
+  // non-printable byte, so the endpoint can never obtain a transaction signature this way.
+  if (!/^[\x20-\x7e]{1,512}$/.test(cj.challenge)) throw new AuthError("challenge rejected: not printable text", 0);
   const sig = nacl.sign.detached(new TextEncoder().encode(cj.challenge), b.secretKey);
   const lr = await fetchImpl(`${endpoint}/auth/login`, {
     method: "POST",
