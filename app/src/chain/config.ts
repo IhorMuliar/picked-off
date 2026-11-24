@@ -9,6 +9,7 @@
  *   VITE_TABLE_IDS   comma-separated house pool table ids, e.g. "1,2"
  *   VITE_SLOT_MS     expected slot time on the rollup in ms (measured at runtime; this is the prior)
  *   VITE_EXPLORER    explorer cluster query, e.g. "?cluster=devnet" ("" = none)
+ *   VITE_DRIP_URL    devnet SOL drip for Tape calls (default "/api/drip" on devnet, none on local; "" = none)
  */
 export type Cluster = "local" | "devnet";
 
@@ -21,9 +22,10 @@ export interface ChainConfig {
   tableIds: bigint[];
   slotMs: number;
   explorer: string | null;
+  dripUrl: string | null;
 }
 
-const DEFAULTS: Record<Cluster, Omit<ChainConfig, "cluster" | "programId" | "tableIds">> = {
+const DEFAULTS: Record<Cluster, Omit<ChainConfig, "cluster" | "programId" | "tableIds" | "dripUrl">> = {
   local: {
     baseRpc: "http://localhost:8899",
     teeRpc: "http://localhost:6699",
@@ -61,6 +63,7 @@ export function makeConfig(env: Record<string, string | boolean | undefined>): C
   const ids = parseTableIds(str("VITE_TABLE_IDS"));
   const slotMs = Number(str("VITE_SLOT_MS") ?? d.slotMs);
   const explorer = str("VITE_EXPLORER");
+  const drip = env.VITE_DRIP_URL;
   return {
     cluster,
     baseRpc: (str("VITE_BASE_RPC") ?? d.baseRpc).replace(/\/$/, ""),
@@ -70,6 +73,7 @@ export function makeConfig(env: Record<string, string | boolean | undefined>): C
     tableIds: ids.length ? ids : [1n],
     slotMs: Number.isFinite(slotMs) && slotMs > 0 ? slotMs : d.slotMs,
     explorer: explorer === undefined ? d.explorer : explorer,
+    dripUrl: typeof drip === "string" ? drip.trim() || null : cluster === "devnet" ? "/api/drip" : null,
   };
 }
 

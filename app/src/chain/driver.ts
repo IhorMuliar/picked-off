@@ -22,7 +22,7 @@ import {
   decodeBook, decodeCall, decodeConfig, decodeDesk, decodeRound, decodeTable, decodeTape, isAccount,
   PHASE, ROUND_STATUS, SEAT, TABLE_KIND, type Call, type Config, type Desk, type Table, type Tape,
 } from "./layout";
-import { joinIx, placeCallIx, claimCallIx } from "./ix";
+import { joinIx, placeCallIx, claimCallIx, settleRoundIx } from "./ix";
 import { ACT_PING, ACT_REQUOTE } from "./wire";
 import { bellChance, buildReveal, printsOfBeat, recordFromBook, resultsOfBeat, seatsView, SKIM_STEP } from "./views";
 import { runPeek } from "./peek";
@@ -127,7 +127,9 @@ class ChainDriver implements GameDriver {
   private tape: Tape | null = null;
   private call: Call | null = null;
   private needsFunding = false;
-  private claimTried = new Set<string>();
+  private claimDone = new Set<string>();
+  private claiming = false;
+  private dripping = false;
   private note: { text: string; until: number } | null = null;
   private readonly playerLabel: string;
   /** Idle seat release: a round with no player input lets the seat go at the next round. */
@@ -441,6 +443,7 @@ class ChainDriver implements GameDriver {
   }
 
   private onDesk(raw: Uint8Array | null) {
+    const arrivedAt = now();
     const t = this.table;
     if (!raw || !isAccount(raw, "Desk")) {
       this.deskReadable = false;
@@ -485,7 +488,7 @@ class ChainDriver implements GameDriver {
         // anchor the measured number on this beat's scheduled close (its deadline slot)
         const close = this.timeOf(t.hideEndSlot + BigInt(b) * t.beatSlots);
         if (b === top) {
-          this.lags.push(now() - close);
+          this.lags.push(arrivedAt - close);
           if (this.lags.length > 1000) this.lags.shift();
         }
         this.w.set((s) => ({ clock: { ...s.clock, liveStartedAt: close - b * BEAT_MS } }));
@@ -500,7 +503,7 @@ class ChainDriver implements GameDriver {
               nextSkim = res.next ?? nextSkim;
             } else if (lastFill === res.level) lastFill = null;
           }
-          this.w.pushResult(res);
+          this.w.pushResult({ ...res, arrivedAt });
         }
       }
       if (top > this.seenDeskBeat) this.seenDeskBeat = top;
@@ -775,7 +778,7 @@ class ChainDriver implements GameDriver {
     if (this.round !== null && tp.round !== this.round) return;
     this.tape = tp;
     this.w.set({ tape: this.tapeView() });
-    if (tp.resolved && this.call && !this.call.claimed) void this.claim().catch((e) => this.flash(`claim failed: ${(e as Error).message}`));
+    this.maybeClaim();
   }
 
   private onCall(d: Uint8Array | null) {
@@ -783,7 +786,24 @@ class ChainDriver implements GameDriver {
     // a Call that disappears after the settle was paid out (anyone may send the claim)
     if (this.call) this.myCallDesk = this.call.desk;
     this.w.set({ tape: this.tapeView() });
-    if (this.tape?.resolved && this.call && !this.call.claimed) void this.claim().catch(() => {});
+    this.maybeClaim();
+  }
+
+  /** After the bell, settle + claim this key's call in one tx (the house sweep may get there first). */
+  private maybeClaim() {
+    const tp = this.tape;
+    if (!tp || !this.call || this.call.claimed || this.call.owed > 0n || this.claiming) return;
+    if (!tp.resolved && !(this.table && this.table.round === tp.round && this.table.phase === PHASE.revealed)) return;
+    if (this.claimDone.has(`${tp.tableId}:${tp.round}`)) return;
+    this.claiming = true;
+    void this.claim()
+      .catch((e) => {
+        // before the Round is committed to the base layer the settle fails in preflight: retry on the next poll
+        if (tp.resolved) this.flash(`claim failed: ${(e as Error).message}`);
+      })
+      .finally(() => {
+        this.claiming = false;
+      });
   }
 
   private async funded(need: number): Promise<boolean> {
@@ -806,8 +826,10 @@ class ChainDriver implements GameDriver {
     if (!this.config) await this.loadConfig();
     const callLamports = Number(this.config?.callLamports ?? 10_000_000n);
     const rent = await this.base.connection.getMinimumBalanceForRentExemption(CALL_ACCOUNT_BYTES);
-    if (!(await this.funded(callLamports + rent + BASE_FEE_RESERVE))) return;
+    const need = callLamports + rent + BASE_FEE_RESERVE;
+    if (!(await this.funded(need)) && !(await this.drip(need))) return;
     const round = this.round;
+    if (this.round === null || this.myCallDesk !== null) return;
     await this.sendTx(this.base.connection, [placeCallIx(this.pdas, this.tableId, round, this.me, desk)], true);
     if (this.round === round) {
       this.myCallDesk = desk;
@@ -817,14 +839,52 @@ class ChainDriver implements GameDriver {
     this.watches.tape?.poke();
   }
 
+  /** Ask the devnet drip for SOL for one call and wait until it lands; false (and a message) on failure. */
+  private async drip(need: number): Promise<boolean> {
+    if (!this.cfg.dripUrl) {
+      this.flash(`Tape calls need devnet SOL on this browser's key ${this.burner.address}`);
+      return false;
+    }
+    if (this.dripping) return false;
+    this.dripping = true;
+    this.refreshBanner();
+    try {
+      const res = await fetch(this.cfg.dripUrl, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ address: this.burner.address }),
+      });
+      const body = (await res.json().catch(() => ({}))) as { ok?: boolean; message?: string; error?: string };
+      if (!res.ok || !body.ok) throw new Error(body.message ?? body.error ?? `HTTP ${res.status}`);
+      for (let i = 0; i < 40 && !this.stopped; i++) {
+        if (await this.funded(need).catch(() => false)) return true;
+        await sleep(500);
+      }
+      throw new Error("the SOL did not arrive in 20 s");
+    } catch (e) {
+      this.flash(`no devnet SOL for the call: ${(e as Error).message}`);
+      return false;
+    } finally {
+      this.dripping = false;
+      this.refreshBanner();
+    }
+  }
+
   private async claim() {
-    if (!this.tape || this.tableId === null) return;
-    const id = `${this.tape.tableId}:${this.tape.round}`;
-    if (this.claimTried.has(id)) return;
+    const tp = this.tape;
+    if (!tp || this.tableId === null) return;
+    const id = `${tp.tableId}:${tp.round}`;
     if (!(await this.funded(BASE_FEE_RESERVE))) return;
-    this.claimTried.add(id);
-    await this.sendTx(this.base.connection, [claimCallIx(this.pdas, this.tableId, this.tape.round, this.me, this.me)], true);
+    // client rule: settle_round and claim_call in the same transaction
+    await this.sendTx(
+      this.base.connection,
+      [settleRoundIx(this.pdas, tp.tableId, tp.round, this.me), claimCallIx(this.pdas, tp.tableId, tp.round, this.me, this.me)],
+      true,
+    );
+    this.claimDone.add(id);
+    this.flash("Tape call settled and claimed");
     this.watches.call?.poke();
+    this.watches.tape?.poke();
   }
 
   /* ================================================================ reveal */
@@ -901,6 +961,7 @@ class ChainDriver implements GameDriver {
     else if (!t) b = { kind: "connecting", text: "looking for a pool" };
     else if (this.joining) b = { kind: "connecting", text: "taking a seat" };
     else if (t.phase === PHASE.idle) b = { kind: "waiting", text: "waiting for the house to open the first round" };
+    else if (this.dripping) b = { kind: "connecting", text: "getting devnet SOL for your Tape call from the drip" };
     else if (this.needsFunding) b = { kind: "info", text: `Tape calls need devnet SOL on this browser's key ${this.burner.address.slice(0, 6)}…` };
     this.banner.show(b);
   }

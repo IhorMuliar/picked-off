@@ -10,4 +10,5 @@ interface ImportMetaEnv {
   readonly VITE_TABLE_IDS?: string;
   readonly VITE_SLOT_MS?: string;
   readonly VITE_EXPLORER?: string;
+  readonly VITE_DRIP_URL?: string;
 }

@@ -272,10 +272,13 @@ function Ladder() {
         } else setTimeout(() => sfx.miss(), r.algo ? 80 : 0);
       }
     }
-    // the one number: beat's scheduled close -> result painted
+    // the one number: beat's scheduled close -> result in this browser (arrival time when the
+    // driver knows it, so a throttled frame loop does not inflate it; else the next frame)
     const { clock, table } = useGame.getState();
     const close = clock.liveStartedAt + latestBeat * BEAT_MS;
-    requestAnimationFrame(() => recordLatency(table.round, latestBeat, performance.now() - close));
+    const arrived = batch.find((r) => r.arrivedAt !== undefined)?.arrivedAt;
+    if (arrived !== undefined) recordLatency(table.round, latestBeat, arrived - close);
+    else requestAnimationFrame(() => recordLatency(table.round, latestBeat, performance.now() - close));
   }, [results, addFx, pos]);
 
   useEffect(() => {

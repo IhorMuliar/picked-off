@@ -137,6 +137,8 @@ export type ResultKind = "fill" | "miss" | "pickedoff";
 export interface PrivateResult {
   id: number;
   beat: number;
+  /** performance.now() when the result reached the browser (chain driver), for the header number. */
+  arrivedAt?: number;
   kind: ResultKind;
   /** Pinged level for fill/miss; absent for pickedoff (victims never learn where from). */
   level?: number;

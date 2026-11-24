@@ -6,7 +6,7 @@ export function Header() {
   const source = useGame((s) => s.table.source);
   const muted = useUi((s) => s.muted);
   const title =
-    "Measured in this browser: from each beat's scheduled close to this desk's private result on screen, p95 over the last 1,000 beats" +
+    "Measured in this browser: from each beat's scheduled close to this desk's private result reaching this browser, p95 over the last 1,000 beats" +
     (source === "mock" ? " (local simulation)" : "");
   return (
     <header>
