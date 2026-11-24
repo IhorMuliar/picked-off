@@ -272,13 +272,16 @@ function Ladder() {
         } else setTimeout(() => sfx.miss(), r.algo ? 80 : 0);
       }
     }
-    // the one number: beat's scheduled close -> result in this browser (arrival time when the
-    // driver knows it, so a throttled frame loop does not inflate it; else the next frame)
+    // the one number: beat's scheduled close -> private result. The chain driver measures it on
+    // arrival and marks only genuine samples; the mock has no network, so it uses the next frame.
     const { clock, table } = useGame.getState();
-    const close = clock.liveStartedAt + latestBeat * BEAT_MS;
-    const arrived = batch.find((r) => r.arrivedAt !== undefined)?.arrivedAt;
-    if (arrived !== undefined) recordLatency(table.round, latestBeat, arrived - close);
-    else requestAnimationFrame(() => recordLatency(table.round, latestBeat, performance.now() - close));
+    if (table.source === "mock") {
+      const close = clock.liveStartedAt + latestBeat * BEAT_MS;
+      requestAnimationFrame(() => recordLatency(table.round, latestBeat, performance.now() - close));
+    } else {
+      const ms = batch.find((r) => r.latencyMs !== undefined)?.latencyMs;
+      if (ms !== undefined) recordLatency(table.round, latestBeat, ms);
+    }
   }, [results, addFx, pos]);
 
   useEffect(() => {

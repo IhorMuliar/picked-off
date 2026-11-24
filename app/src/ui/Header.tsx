@@ -1,6 +1,9 @@
 import { useGame, useUi } from "../state/store";
 import { setMuted, sfx, unlockAudio } from "../fx/sound";
 
+/** The header shows the p95 only once this many beats are measured. */
+const MIN_SAMPLES = 8;
+
 export function Header() {
   const latency = useGame((s) => s.latency);
   const source = useGame((s) => s.table.source);
@@ -17,8 +20,15 @@ export function Header() {
       <div className="hook">Hide your order in the dark book. Ping to pick off theirs.</div>
       <div className="spacer" />
       <div className="number mono" title={title} data-testid="number">
-        beat → private result <b>{latency.p95 === null ? "…" : `${Math.round(latency.p95)} ms`}</b> p95 · n=
-        {latency.n.toLocaleString("en-US")}
+        {latency.p95 === null || latency.n < MIN_SAMPLES ? (
+          <>
+            beat → private result <b>measuring…</b> n={latency.n}
+          </>
+        ) : (
+          <>
+            beat → private result <b>{Math.round(latency.p95)} ms</b> p95 · n={latency.n.toLocaleString("en-US")}
+          </>
+        )}
       </div>
       <button
         className="chip peek"

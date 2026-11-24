@@ -1,5 +1,5 @@
 /**
- * Devnet drip: sends a fresh browser key just enough devnet SOL for one Tape call
+ * Devnet drip: tops a browser key up to enough devnet SOL for one Tape call
  * (the 0.01 call + the Call account's rent + fees). Free play never needs it.
  *
  *   POST /api/drip  {"address": "<base58 public key>"}
@@ -8,16 +8,22 @@
  *   GET  /api/drip  -> {ok, enabled, address, balance, lamports, floor, today, dailyCap}
  *
  * Server-side env (never VITE_*): DRIP_SECRET_KEY (JSON array of 64 bytes, a devnet-only key),
- * optional DRIP_LAMPORTS (12000000), DRIP_FLOOR_LAMPORTS (100000000), DRIP_DAILY_CAP (50),
- * DRIP_IP_DAILY_CAP (3), DRIP_RPC (defaults to VITE_BASE_RPC, then the public devnet RPC),
+ * optional DRIP_LAMPORTS (12000000: the balance a drip tops up to), DRIP_CALL_COST (11690400: below
+ * this a key cannot call), DRIP_FLOOR_LAMPORTS (100000000), DRIP_DAILY_CAP (50), DRIP_IP_DAILY_CAP (3),
+ * DRIP_ADDRESS_DAILY_CAP (3), DRIP_RPC (defaults to VITE_BASE_RPC, then the public devnet RPC),
  * DRIP_DISABLED=1 to switch it off.
  *
  * Limits, without a database:
- *  - the address must be a plain ed25519 key (on curve), hold no data and less than one drip;
- *  - one drip per address, ever: its on-chain history is checked for a transaction paid by the drip key;
- *  - a global cap per 24 h, counted from the drip key's own on-chain signatures (shared by all instances);
+ *  - the address must be a plain ed25519 key (on curve) holding no data and less than one call's cost;
+ *    it is topped up to DRIP_LAMPORTS, never more;
+ *  - at most DRIP_ADDRESS_DAILY_CAP drips per address per rolling 24 h, counted from its on-chain history;
+ *  - a global cap per 24 h, counted from the drip key's own on-chain signatures (shared by all instances)
+ *    and re-read immediately before signing;
  *  - a per-IP cap per 24 h, in memory: per function instance, reset on a cold start (weak);
- *  - the drip key keeps a floor balance; below it the drip refuses;
+ *  - per instance, drips run one at a time from a short bounded queue (429 beyond it); the IP slot and an
+ *    in-flight count are reserved before any RPC work and released if the drip fails, and in-flight drips
+ *    count against the daily cap and the floor;
+ *  - the drip key keeps a floor balance; below it the drip refuses (the hard stop across instances);
  *  - the cluster must be devnet (genesis hash), or nothing is sent.
  *
  * Plain JSON-RPC + tweetnacl (no web3.js: its websocket dependency does not load in the function runtime).
@@ -32,13 +38,16 @@ declare const process: { env: Record<string, string | undefined> };
 const DEVNET_GENESIS = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
 const SYSTEM_PROGRAM = "11111111111111111111111111111111";
 const DAY_MS = 86_400_000;
-const HISTORY_LIMIT = 50;
+const HISTORY_LIMIT = 100;
 
 const num = (name: string, dflt: number) => {
   const v = Number(process.env[name]);
   return Number.isFinite(v) && v > 0 ? v : dflt;
 };
 const LAMPORTS = num("DRIP_LAMPORTS", 12_000_000);
+const CALL_COST = Math.min(num("DRIP_CALL_COST", 11_690_400), LAMPORTS);
+const ADDRESS_DAILY_CAP = num("DRIP_ADDRESS_DAILY_CAP", 3);
+const QUEUE_MAX = 4;
 const FLOOR = num("DRIP_FLOOR_LAMPORTS", 100_000_000);
 const DAILY_CAP = num("DRIP_DAILY_CAP", 50);
 const IP_DAILY_CAP = num("DRIP_IP_DAILY_CAP", 3);
@@ -46,6 +55,15 @@ const RPC = process.env.DRIP_RPC || process.env.VITE_BASE_RPC || "https://rpc.ma
 
 const byIp = new Map<string, number[]>();
 const pending = new Set<string>();
+let inFlight = 0;
+let queued = 0;
+let chain: Promise<unknown> = Promise.resolve();
+/** Run `f` after every earlier drip of this instance has finished (one at a time). */
+function serial<T>(f: () => Promise<T>): Promise<T> {
+  const run = chain.then(f, f);
+  chain = run.catch(() => {});
+  return run;
+}
 let devnetChecked = false;
 let key: { secretKey: Uint8Array; publicKey: Uint8Array; address: string } | null = null;
 
@@ -107,19 +125,20 @@ async function sentToday(addr: string): Promise<number> {
   return (await signatures(addr, 1000)).filter((s) => s.err === null && (s.blockTime ?? 0) >= since).length;
 }
 
-/** true if `to` already took part in a transaction paid by the drip key (or has too much history to tell). */
-async function alreadyDripped(to: string, from: string): Promise<boolean> {
-  const sigs = await signatures(to, HISTORY_LIMIT);
-  if (!sigs.length) return false;
-  if (sigs.length >= HISTORY_LIMIT) return true;
-  for (const s of sigs) {
-    const tx = await rpc<{ transaction: { message: { accountKeys: string[] } } } | null>("getTransaction", [
-      s.signature,
-      { commitment: "confirmed", encoding: "json", maxSupportedTransactionVersion: 0 },
-    ]);
-    if (tx?.transaction.message.accountKeys[0] === from) return true;
-  }
-  return false;
+/** Drips (transactions paid by the drip key) that `to` received in the last 24 h; Infinity if its history is too busy to tell. */
+async function dripsToday(to: string, from: string): Promise<number> {
+  const since = (Date.now() - DAY_MS) / 1000;
+  const sigs = (await signatures(to, HISTORY_LIMIT)).filter((s) => (s.blockTime ?? since) >= since);
+  if (sigs.length >= HISTORY_LIMIT) return Infinity;
+  const txs = await Promise.all(
+    sigs.map((s) =>
+      rpc<{ transaction: { message: { accountKeys: string[] } } } | null>("getTransaction", [
+        s.signature,
+        { commitment: "confirmed", encoding: "json", maxSupportedTransactionVersion: 0 },
+      ]),
+    ),
+  );
+  return txs.filter((tx) => tx?.transaction.message.accountKeys[0] === from).length;
 }
 
 /** A legacy transaction with one SystemProgram transfer, signed by the drip key; base64. */
@@ -155,12 +174,17 @@ function clientIp(req: Request): string {
   return xff.split(",")[0].trim() || "unknown";
 }
 
-function ipAllowed(ip: string): boolean {
+/** Reserve one drip for `ip` (released with the returned function if the drip fails); null if over the cap. */
+function reserveIp(ip: string): (() => void) | null {
   const t = Date.now();
   const recent = (byIp.get(ip) ?? []).filter((x) => x > t - DAY_MS);
-  byIp.set(ip, recent);
   if (byIp.size > 10_000) byIp.clear();
-  return recent.length < IP_DAILY_CAP;
+  if (recent.length >= IP_DAILY_CAP) {
+    byIp.set(ip, recent);
+    return null;
+  }
+  byIp.set(ip, [...recent, t]);
+  return () => byIp.set(ip, (byIp.get(ip) ?? []).filter((x) => x !== t));
 }
 
 export async function GET(): Promise<Response> {
@@ -170,7 +194,7 @@ export async function GET(): Promise<Response> {
     const [bal, today] = await Promise.all([balance(k.address), sentToday(k.address)]);
     return json(200, {
       ok: true, enabled: process.env.DRIP_DISABLED !== "1", address: k.address,
-      balance: bal, lamports: LAMPORTS, floor: FLOOR, today, dailyCap: DAILY_CAP,
+      balance: bal, lamports: LAMPORTS, callCost: CALL_COST, floor: FLOOR, today, dailyCap: DAILY_CAP, addressDailyCap: ADDRESS_DAILY_CAP,
     });
   } catch (e) {
     return fail(502, "rpc_error", (e as Error).message);
@@ -201,37 +225,52 @@ export async function POST(req: Request): Promise<Response> {
   if (address === k.address) return fail(400, "bad_address", "that is the drip itself");
 
   const ip = clientIp(req);
-  if (!ipAllowed(ip)) return fail(429, "ip_limit", `at most ${IP_DAILY_CAP} drips per day from one address`);
   if (pending.has(address)) return fail(409, "in_flight", "a drip to this key is already on its way");
+  if (queued >= QUEUE_MAX) return fail(429, "busy", "the drip is busy; try again in a few seconds");
+  const releaseIp = reserveIp(ip);
+  if (!releaseIp) return fail(429, "ip_limit", `at most ${IP_DAILY_CAP} drips per day from one address`);
 
   pending.add(address);
+  queued++;
+  let sent = false;
   try {
-    if (!(await isDevnet())) return fail(403, "devnet_only", "the drip runs on devnet only");
-    const [acct, dripBal, today] = await Promise.all([
-      rpc<{ value: { lamports: number; owner: string; data: [string, string] } | null }>("getAccountInfo", [
-        address, { commitment: "confirmed", encoding: "base64" },
-      ]),
-      balance(k.address),
-      sentToday(k.address),
-    ]);
-    const a = acct.value;
-    if (a && (a.data[0].length > 0 || a.owner !== SYSTEM_PROGRAM)) return fail(400, "bad_address", "not a plain wallet key");
-    if ((a?.lamports ?? 0) >= LAMPORTS) return fail(409, "funded", "this key already holds enough devnet SOL");
-    if (dripBal < FLOOR + LAMPORTS) return fail(503, "empty", "the drip is out of devnet SOL for now");
-    if (today >= DAILY_CAP) return fail(429, "daily_limit", "the drip's daily limit is reached; try tomorrow");
-    if (await alreadyDripped(address, k.address)) return fail(409, "already_dripped", "this key already had its drip");
+    return await serial(async () => {
+      inFlight++;
+      try {
+        if (!(await isDevnet())) return fail(403, "devnet_only", "the drip runs on devnet only");
+        const acct = await rpc<{ value: { lamports: number; owner: string; data: [string, string] } | null }>("getAccountInfo", [
+          address, { commitment: "confirmed", encoding: "base64" },
+        ]);
+        const a = acct.value;
+        if (a && (a.data[0].length > 0 || a.owner !== SYSTEM_PROGRAM)) return fail(400, "bad_address", "not a plain wallet key");
+        const has = a?.lamports ?? 0;
+        if (has >= CALL_COST) return fail(409, "funded", "this key already holds enough devnet SOL for a call");
+        if ((await dripsToday(address, k.address)) >= ADDRESS_DAILY_CAP)
+          return fail(429, "address_limit", `this key had its ${ADDRESS_DAILY_CAP} drips for today`);
+        const amount = LAMPORTS - has;
+        // cross-instance guard: re-read the drip key's own history and balance right before signing
+        const [dripBal, today] = await Promise.all([balance(k.address), sentToday(k.address)]);
+        if (dripBal < FLOOR + amount * inFlight) return fail(503, "empty", "the drip is out of devnet SOL for now");
+        if (today + inFlight > DAILY_CAP) return fail(429, "daily_limit", "the drip's daily limit is reached; try tomorrow");
 
-    const { value } = await rpc<{ value: { blockhash: string } }>("getLatestBlockhash", [{ commitment: "confirmed" }]);
-    const sig = await rpc<string>("sendTransaction", [
-      transferTx(k, to, LAMPORTS, value.blockhash),
-      { encoding: "base64", skipPreflight: false, preflightCommitment: "confirmed", maxRetries: 3 },
-    ]);
-    await confirm(sig);
-    byIp.set(ip, [...(byIp.get(ip) ?? []), Date.now()]);
-    return json(200, { ok: true, sig, lamports: LAMPORTS });
+        const { value } = await rpc<{ value: { blockhash: string } }>("getLatestBlockhash", [{ commitment: "confirmed" }]);
+        const sig = await rpc<string>("sendTransaction", [
+          transferTx(k, to, amount, value.blockhash),
+          { encoding: "base64", skipPreflight: false, preflightCommitment: "confirmed", maxRetries: 3 },
+        ]);
+        sent = true;
+        await confirm(sig);
+        return json(200, { ok: true, sig, lamports: amount });
+      } finally {
+        inFlight--;
+      }
+    });
   } catch (e) {
     return fail(502, "send_failed", (e as Error).message.slice(0, 300));
   } finally {
+    queued--;
     pending.delete(address);
+    // a drip that never reached the network does not use up the IP's allowance
+    if (!sent) releaseIp();
   }
 }

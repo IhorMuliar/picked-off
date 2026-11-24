@@ -34,6 +34,8 @@ const ADJ = ["bright", "quiet", "swift", "amber", "silver", "lucky", "steady", "
 const ANIMAL = ["otter", "heron", "fox", "lynx", "wren", "marten", "kestrel", "hare", "owl", "stoat"];
 const CALL_ACCOUNT_BYTES = 112;
 const BASE_FEE_RESERVE = 20_000;
+/** A client claim waits this long after its call (the house sweep claims right after the round). */
+const CLAIM_AFTER_MS = 150_000;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const now = () => performance.now();
@@ -63,6 +65,8 @@ export interface ChainStatus {
   resultLagP50: number | null;
   resultLagP95: number | null;
   resultLagN: number;
+  /** the latest genuine samples, ms */
+  resultLags: number[];
   deskActs: number | null;
   deskLastSeq: number | null;
   lastSentSeq: number | null;
@@ -114,6 +118,18 @@ class ChainDriver implements GameDriver {
   private sentAt = new Map<number, number>();
   private acks: number[] = [];
   private lags: number[] = [];
+  private deskFirstPushAt: number | null = null;
+  /** Every desk of every pool is held by a player: watching, and taking the first desk that frees up. */
+  private waitingSeat = false;
+  /** Test hook `?seatsfull=<seconds>`: treat every seat as a player's for that long after load. */
+  private readonly pretendFullUntil = (() => {
+    try {
+      const v = Number(new URLSearchParams(location.search).get("seatsfull"));
+      return Number.isFinite(v) && v > 0 ? now() + v * 1000 : 0;
+    } catch {
+      return 0;
+    }
+  })();
   private lastSentSeq: number | null = null;
   private joinErrors: string[] = [];
   private myCallDesk: number | null = null;
@@ -127,7 +143,7 @@ class ChainDriver implements GameDriver {
   private tape: Tape | null = null;
   private call: Call | null = null;
   private needsFunding = false;
-  private claimDone = new Set<string>();
+  private pendingClaims = new Map<string, { t: bigint; n: bigint; calledAt: number; tries: number }>();
   private claiming = false;
   private dripping = false;
   private note: { text: string; until: number } | null = null;
@@ -238,6 +254,7 @@ class ChainDriver implements GameDriver {
     for (let i = 0; i < 3; i++) await this.sampleSlot();
     this.every(2000, () => void this.sampleSlot());
     this.every(1000, () => this.refreshBanner());
+    this.every(5000, () => void this.checkClaims());
     void this.loadConfig();
     // 3. find the pool
     while (!this.stopped && this.tableId === null) {
@@ -286,15 +303,47 @@ class ChainDriver implements GameDriver {
     }
     const mine = found.find((t) => t.seats.some((s) => s.key === this.burner.address));
     const humans = (t: Table) => t.seats.filter((s) => s.kind === SEAT.human).length;
-    const open = (t: Table) => t.kind === TABLE_KIND.house && t.seats.some((s) => s.kind !== SEAT.human);
+    const open = (t: Table) => this.hasFreeSeat(t);
     const pick = mine ?? found.filter(open).sort((a, b) => humans(a) - humans(b))[0] ?? found[0];
+    if (!mine && !open(pick)) this.waitingSeat = true;
     this.tableId = pick.tableId;
     this.watches.table = watchAccount(this.tee, this.pdas.table(pick.tableId), (d) => this.onTable(d), {
       expectEveryMs: 1000,
       onError: () => {},
     });
     this.onTable(pick);
-    if (!mine) void this.joinFlow();
+    this.every(3000, () => void this.seekSeat());
+    if (!mine && !this.waitingSeat) void this.joinFlow();
+  }
+
+  /** A seat a newcomer cannot take (a player holds it, or the test hook pretends so). */
+  private heldByPlayer(t: Table, i: number): boolean {
+    return now() < this.pretendFullUntil || t.seats[i].kind === SEAT.human;
+  }
+
+  private hasFreeSeat(t: Table): boolean {
+    return t.kind === TABLE_KIND.house && t.seats.some((_, i) => !this.heldByPlayer(t, i));
+  }
+
+  /** While waiting for a desk: join here if one is free, else move to another pool that has one. */
+  private async seekSeat() {
+    if (!this.waitingSeat || this.seat !== null || this.joining || this.tableId === null) return;
+    if (this.table && this.hasFreeSeat(this.table)) return void this.joinFlow();
+    for (const id of this.cfg.tableIds) {
+      if (id === this.tableId) continue;
+      const d = await this.tee.get(this.pdas.table(id)).catch(() => null);
+      if (!d || !isAccount(d, "Table")) continue;
+      const t = decodeTable(d);
+      if (!this.hasFreeSeat(t) || this.seat !== null || !this.waitingSeat) continue;
+      // switch pools: a fresh view of the other table, then join there
+      this.unwatch("table");
+      this.round = null;
+      this.table = null;
+      this.tableId = id;
+      this.watches.table = watchAccount(this.tee, this.pdas.table(id), (x) => this.onTable(x), { expectEveryMs: 1000, onError: () => {} });
+      this.onTable(t);
+      return void this.joinFlow();
+    }
   }
 
   private unwatch(k: string) {
@@ -415,6 +464,7 @@ class ChainDriver implements GameDriver {
 
   private takeSeat(idx: number) {
     if (this.tableId === null) return;
+    this.waitingSeat = false;
     this.unwatch("desk");
     this.seat = idx;
     this.desk = null;
@@ -424,7 +474,8 @@ class ChainDriver implements GameDriver {
     this.myDesk = this.freshMe();
     this.w.set((s) => ({ me: null, canJoin: false, table: { ...s.table, mySeat: idx } }));
     const key = this.pdas.desk(this.tableId, idx);
-    this.watches.desk = watchAccount(this.tee, key, (d) => this.onDesk(d), {
+    this.deskFirstPushAt = null;
+    this.watches.desk = watchAccount(this.tee, key, (d, via) => this.onDesk(d, via), {
       expectEveryMs: 500,
       isLive: () => !!this.table && (this.table.phase === PHASE.hide || this.table.phase === PHASE.live),
       onError: () => {},
@@ -442,8 +493,9 @@ class ChainDriver implements GameDriver {
     this.w.set((s) => ({ me: null, canJoin: true, table: { ...s.table, mySeat: null } }));
   }
 
-  private onDesk(raw: Uint8Array | null) {
+  private onDesk(raw: Uint8Array | null, via: "push" | "poll" = "poll") {
     const arrivedAt = now();
+    if (via === "push" && raw && this.deskFirstPushAt === null) this.deskFirstPushAt = arrivedAt;
     const t = this.table;
     if (!raw || !isAccount(raw, "Desk")) {
       this.deskReadable = false;
@@ -487,8 +539,14 @@ class ChainDriver implements GameDriver {
         }
         // anchor the measured number on this beat's scheduled close (its deadline slot)
         const close = this.timeOf(t.hideEndSlot + BigInt(b) * t.beatSlots);
-        if (b === top) {
-          this.lags.push(arrivedAt - close);
+        // The one number counts only genuine samples: the latest beat of this update, delivered by
+        // the live subscription, with the slot clock already fitted and the subscription already
+        // pushing before the beat's deadline (so not the takeover beat or a catch-up read).
+        // Slow genuine results are kept.
+        let latencyMs: number | undefined;
+        if (b === top && via === "push" && this.clock.fitted && this.deskFirstPushAt !== null && this.deskFirstPushAt < close) {
+          latencyMs = arrivedAt - close;
+          this.lags.push(latencyMs);
           if (this.lags.length > 1000) this.lags.shift();
         }
         this.w.set((s) => ({ clock: { ...s.clock, liveStartedAt: close - b * BEAT_MS } }));
@@ -503,7 +561,7 @@ class ChainDriver implements GameDriver {
               nextSkim = res.next ?? nextSkim;
             } else if (lastFill === res.level) lastFill = null;
           }
-          this.w.pushResult({ ...res, arrivedAt });
+          this.w.pushResult(latencyMs === undefined ? res : { ...res, latencyMs });
         }
       }
       if (top > this.seenDeskBeat) this.seenDeskBeat = top;
@@ -696,9 +754,14 @@ class ChainDriver implements GameDriver {
           await this.refreshTable(tid);
           continue;
         }
-        const free = (k: number) => [...t.seats.keys()].filter((i) => t.seats[i].kind === k && !tried.has(i));
+        const free = (k: number) => [...t.seats.keys()].filter((i) => t.seats[i].kind === k && !this.heldByPlayer(t, i) && !tried.has(i));
         const seat = free(SEAT.empty)[0] ?? free(SEAT.bot)[0];
         if (seat === undefined) {
+          if (!this.hasFreeSeat(t)) {
+            // every desk is a player's: watch, and take the first one that frees up (seekSeat)
+            this.waitingSeat = true;
+            break;
+          }
           for (let i = 0; i < 8; i++) tried.add(i);
           continue;
         }
@@ -722,7 +785,8 @@ class ChainDriver implements GameDriver {
         }
         tried.add(seat);
       }
-      if (this.seat === null) this.flash("could not take a seat · try again");
+      if (this.seat === null && !this.waitingSeat) this.flash("could not take a seat · try again");
+      if (this.seat !== null) this.waitingSeat = false;
     } finally {
       this.joining = false;
       this.refreshBanner();
@@ -740,7 +804,8 @@ class ChainDriver implements GameDriver {
     tx.feePayer = this.me;
     tx.recentBlockhash = (await c.getLatestBlockhash("confirmed")).blockhash;
     tx.sign(Keypair.fromSecretKey(this.burner.secretKey));
-    const sig = await c.sendRawTransaction(tx.serialize(), { skipPreflight: !preflight, maxRetries: 3 });
+    // preflight against the newest state, so a tx another party has just made invalid is refused, not landed
+    const sig = await c.sendRawTransaction(tx.serialize(), { skipPreflight: !preflight, preflightCommitment: "processed", maxRetries: 3 });
     for (let i = 0; i < 60; i++) {
       const st = await c.getSignatureStatuses([sig]).catch(() => null);
       const v = st?.value?.[0];
@@ -778,7 +843,6 @@ class ChainDriver implements GameDriver {
     if (this.round !== null && tp.round !== this.round) return;
     this.tape = tp;
     this.w.set({ tape: this.tapeView() });
-    this.maybeClaim();
   }
 
   private onCall(d: Uint8Array | null) {
@@ -786,24 +850,44 @@ class ChainDriver implements GameDriver {
     // a Call that disappears after the settle was paid out (anyone may send the claim)
     if (this.call) this.myCallDesk = this.call.desk;
     this.w.set({ tape: this.tapeView() });
-    this.maybeClaim();
   }
 
-  /** After the bell, settle + claim this key's call in one tx (the house sweep may get there first). */
-  private maybeClaim() {
-    const tp = this.tape;
-    if (!tp || !this.call || this.call.claimed || this.call.owed > 0n || this.claiming) return;
-    if (!tp.resolved && !(this.table && this.table.round === tp.round && this.table.phase === PHASE.revealed)) return;
-    if (this.claimDone.has(`${tp.tableId}:${tp.round}`)) return;
+  /**
+   * Claims are a fallback: the house sweeps settle + claim right after each recorded round, and a
+   * client claim racing it would fail on chain. So the client claims only CLAIM_AFTER_MS after its
+   * call, only if the Call is still open when read just before sending, and always as
+   * settle_round + claim_call in one transaction. A Call that is gone was paid: say so.
+   */
+  private async checkClaims() {
+    if (this.claiming || !this.pendingClaims.size) return;
     this.claiming = true;
-    void this.claim()
-      .catch((e) => {
-        // before the Round is committed to the base layer the settle fails in preflight: retry on the next poll
-        if (tp.resolved) this.flash(`claim failed: ${(e as Error).message}`);
-      })
-      .finally(() => {
-        this.claiming = false;
-      });
+    try {
+      for (const [id, p] of [...this.pendingClaims]) {
+        const tapeKey = this.pdas.tape(p.t, p.n);
+        const d = await this.base.connection.getAccountInfo(this.pdas.call(tapeKey, this.me), "processed").catch(() => undefined);
+        if (d === undefined) continue;
+        const call = d && isAccount(d.data, "Call") ? decodeCall(d.data) : null;
+        if (!call) {
+          this.pendingClaims.delete(id);
+          this.flash(`Tape call on round ${p.n} settled and paid`);
+          continue;
+        }
+        if (call.claimed || call.owed > 0n) {
+          this.pendingClaims.delete(id);
+          continue;
+        }
+        if (now() - p.calledAt < CLAIM_AFTER_MS || p.tries >= 5) continue;
+        p.tries++;
+        try {
+          await this.claim(p.t, p.n);
+          this.pendingClaims.delete(id);
+        } catch {
+          /* not committed yet, or already claimed in between: preflight refused it, nothing landed */
+        }
+      }
+    } finally {
+      this.claiming = false;
+    }
   }
 
   private async funded(need: number): Promise<boolean> {
@@ -831,6 +915,7 @@ class ChainDriver implements GameDriver {
     const round = this.round;
     if (this.round === null || this.myCallDesk !== null) return;
     await this.sendTx(this.base.connection, [placeCallIx(this.pdas, this.tableId, round, this.me, desk)], true);
+    this.pendingClaims.set(`${this.tableId}:${round}`, { t: this.tableId, n: round, calledAt: now(), tries: 0 });
     if (this.round === round) {
       this.myCallDesk = desk;
       this.w.set({ tape: this.tapeView() });
@@ -870,21 +955,11 @@ class ChainDriver implements GameDriver {
     }
   }
 
-  private async claim() {
-    const tp = this.tape;
-    if (!tp || this.tableId === null) return;
-    const id = `${tp.tableId}:${tp.round}`;
-    if (!(await this.funded(BASE_FEE_RESERVE))) return;
+  private async claim(t: bigint, n: bigint) {
+    if (!(await this.funded(BASE_FEE_RESERVE))) throw new Error("no SOL for the fee");
     // client rule: settle_round and claim_call in the same transaction
-    await this.sendTx(
-      this.base.connection,
-      [settleRoundIx(this.pdas, tp.tableId, tp.round, this.me), claimCallIx(this.pdas, tp.tableId, tp.round, this.me, this.me)],
-      true,
-    );
-    this.claimDone.add(id);
+    await this.sendTx(this.base.connection, [settleRoundIx(this.pdas, t, n, this.me), claimCallIx(this.pdas, t, n, this.me, this.me)], true);
     this.flash("Tape call settled and claimed");
-    this.watches.call?.poke();
-    this.watches.tape?.poke();
   }
 
   /* ================================================================ reveal */
@@ -959,6 +1034,8 @@ class ChainDriver implements GameDriver {
     else if (this.tee.state === "connecting") b = { kind: "connecting", text: this.tee.lastError ?? "reconnecting" };
     else if (this.note && this.note.until > now()) b = { kind: "info", text: this.note.text };
     else if (!t) b = { kind: "connecting", text: "looking for a pool" };
+    else if (this.waitingSeat && this.seat === null && !this.joining)
+      b = { kind: "waiting", text: "all desks taken · you are watching · a desk frees up after each round and you take it automatically" };
     else if (this.joining) b = { kind: "connecting", text: "taking a seat" };
     else if (t.phase === PHASE.idle) b = { kind: "waiting", text: "waiting for the house to open the first round" };
     else if (this.dripping) b = { kind: "connecting", text: "getting devnet SOL for your Tape call from the drip" };
@@ -987,6 +1064,7 @@ class ChainDriver implements GameDriver {
       resultLagP50: pct(this.lags, 50),
       resultLagP95: pct(this.lags, 95),
       resultLagN: this.lags.length,
+      resultLags: this.lags.slice(-60).map((x) => Math.round(x)),
       deskActs: this.desk?.acts ?? null,
       deskLastSeq: this.desk?.lastSeq ?? null,
       lastSentSeq: this.lastSentSeq,

@@ -16,6 +16,11 @@ export class SlotClock {
   get ready() {
     return this.offset !== null;
   }
+  /** The slot rate has been fitted from samples spanning >= 5 s (before that: the prior). */
+  get fitted() {
+    const xs = this.samples;
+    return xs.length >= 4 && xs[xs.length - 1].at - xs[0].at >= 5000;
+  }
   add(slot: number, sentAt: number, receivedAt: number) {
     const s = { slot, at: (sentAt + receivedAt) / 2, rtt: receivedAt - sentAt };
     this.samples.push(s);
