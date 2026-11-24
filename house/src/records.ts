@@ -30,7 +30,9 @@ const CLAIMS_PER_TX = 4; // settle_round + up to 4 claim_call fit one transactio
 
 export class Records {
   private recs = new Map<number, Rec>();
-  private busy = false;
+  /** records being driven right now (round → since): each record has its own pass, so one waiting on a slow base
+   *  transaction holds up no other record */
+  private driving = new Map<number, number>();
   private callDisc: Buffer;
   stranded = 0;
   committed = 0;
@@ -68,8 +70,20 @@ export class Records {
   }
 
   private creating = new Map<number, Promise<boolean>>();
+  private abandonedCreates = new Set<number>();
   /** Resolves once no create_record for round n is in flight. */
   async pendingCreate(n: number) { await this.creating.get(n)?.catch(() => false); }
+  /** A create_record for round n is in flight. */
+  isCreating(n: number) { return this.creating.has(n); }
+  /** Round n opened without its record: stop rebroadcasting the create (a copy already out may still land; it is
+   *  then tracked like any record and committed, settled void and closed by the pass). */
+  abandonCreate(n: number) {
+    if (!this.creating.has(n)) return;
+    this.abandonedCreates.add(n);
+    for (const x of [...this.abandonedCreates]) if (x < n - 20) this.abandonedCreates.delete(x);
+  }
+  /** Age in seconds of the longest-running record drive (0 when none). */
+  get driveAgeSec() { let m = 0; const now = Date.now(); for (const t of this.driving.values()) m = Math.max(m, now - t); return Math.round(m / 1000); }
   private lowBalanceLoggedAt = 0;
   /** Creates (and delegates, same tx) the record for round n; optional test call on its Tape. One send per round at a time. */
   create(n: number, plannedUnix: number): Promise<boolean> {
@@ -92,8 +106,16 @@ export class Records {
       await c.progBase.methods.createRecord(new BN(this.t), new BN(n), new BN(plannedUnix)).accountsPartial({ house: c.house.publicKey, config: c.pda.config(), ledger: c.pda.ledger(this.t), round: c.pda.round(this.t, n), tape: c.pda.tape(this.t, n) }).instruction(),
       await c.progBase.methods.delegate(3, new BN(this.t), new BN(n)).accountsPartial({ house: c.house.publicKey, config: c.pda.config(), pda: c.pda.round(this.t, n), validator: c.validator }).instruction(),
     ];
-    const r = await c.sendBase(ixs, { label: `create_record ${this.t}/${n}` });
-    if (!r.ok) { log.warn("record_create_failed", { pool: this.t, round: n, err: errText(r) }); return false; }
+    const roundPda = c.pda.round(this.t, n);
+    const r = await c.sendBase(ixs, {
+      label: `create_record ${this.t}/${n}`,
+      abandoned: () => this.abandonedCreates.has(n),
+      // rebuilt after an expiry only while the record does not exist and its round has not opened yet
+      stillNeeded: async () => !this.abandonedCreates.has(n) && this.currentRound() < n && !(await c.baseRead.account(roundPda)).data,
+    });
+    if (!r.ok && r.err === "obsolete" && (await c.baseRead.account(roundPda)).data) { this.track(n); return true; }
+    if (!r.ok) { log.warn("record_create_failed", { pool: this.t, round: n, err: errText(r), abandoned: this.abandonedCreates.has(n) || undefined }); return false; }
+    if (this.abandonedCreates.has(n)) log.warn("record_created_late", { pool: this.t, round: n, sig: r.sig, note: "its round opened unrecorded; the record pass commits, settles (void) and closes it" });
     this.track(n, r.sig);
     this.lastRecordAt = Date.now();
     log.info("record_created", { pool: this.t, round: n, planned: plannedUnix, sig: r.sig, ms: Math.round(r.ms) });
@@ -142,19 +164,20 @@ export class Records {
     log.info("test_call", { pool: this.t, round: n, desk, ok: r.ok, sig: r.sig, err: r.ok ? undefined : errText(r) });
   }
 
-  /** One pass over every outstanding record (never two passes at once). */
+  /** Starts a drive of every outstanding record that is not being driven already (never two drives of one record
+   *  at once); does not wait for them. */
   async pass() {
-    if (this.busy) return;
-    this.busy = true;
-    try {
-      for (const n of this.outstanding) {
-        try { await this.drive(this.recs.get(n)!); }
-        catch (e: any) { log.warn("record_error", { pool: this.t, round: n, err: String(e?.message ?? e) }); }
-      }
-    } finally {
-      this.busy = false;
+    for (const n of this.outstanding) {
+      const rec = this.recs.get(n);
+      if (!rec || this.driving.has(n)) continue;
+      this.driving.set(n, Date.now());
+      void this.drive(rec)
+        .catch((e: any) => log.warn("record_error", { pool: this.t, round: n, err: String(e?.message ?? e) }))
+        .finally(() => this.driving.delete(n));
     }
   }
+  /** Resolves once no record drive is running (tests). */
+  async idle() { while (this.driving.size) await new Promise((r) => setTimeout(r, 20)); }
 
   private async drive(rec: Rec) {
     const c = this.chain, n = rec.n;
@@ -201,13 +224,16 @@ export class Records {
       const first = open.slice(0, CLAIMS_PER_TX);
       const ixs = [settleIx];
       for (const k of first) ixs.push(await this.claimIx(tapePda, k));
-      let res = await c.sendBase(ixs, { label: `settle_round ${this.t}/${n}` });
+      // after an expiry: rebuilt only while the Tape is still unresolved
+      const unresolved = async () => { const x = await c.baseRead.account(tapePda); return !!x.data && !decodeTape(x.data).resolved; };
+      let res = await c.sendBase(ixs, { label: `settle_round ${this.t}/${n}`, stillNeeded: unresolved });
       if (!res.ok && first.length) {
         // a claim the program refuses must not hold the settlement up: settle alone (claims follow, each with a settle)
         log.warn("record_settle_failed", { pool: this.t, round: n, claims: first.length, err: errText(res), next: "settle alone" });
         first.length = 0;
-        res = await c.sendBase([settleIx], { label: `settle_round ${this.t}/${n}` });
+        res = await c.sendBase([settleIx], { label: `settle_round ${this.t}/${n}`, stillNeeded: unresolved });
       }
+      if (!res.ok && res.err === "obsolete") return; // settled meanwhile: the next pass goes on from chain state
       if (!res.ok) { log.warn("record_settle_failed", { pool: this.t, round: n, claims: first.length, err: errText(res) }); return; }
       rec.settleSig = res.sig;
       tape = decodeTape((await c.baseRead.account(tapePda)).data!);
@@ -218,7 +244,8 @@ export class Records {
     tape = decodeTape((await c.baseRead.account(tapePda)).data!);
     if (tape.openCalls === 0 || nowS >= tape.closeUnix + TAPE_CLOSE_AFTER_S) {
       const ix = await c.progBase.methods.closeRound().accountsPartial({ house: c.house.publicKey, config: c.pda.config(), round: roundPda, tape: tapePda }).instruction();
-      const res = await c.sendBase([ix], { label: `close_round ${this.t}/${n}` });
+      const res = await c.sendBase([ix], { label: `close_round ${this.t}/${n}`, stillNeeded: async () => !!(await c.baseRead.account(roundPda)).data });
+      if (!res.ok && res.err === "obsolete") return; // closed meanwhile: the next pass drops the record
       if (!res.ok) { log.warn("record_close_failed", { pool: this.t, round: n, err: errText(res) }); return; }
       this.closed++;
       this.recs.delete(n);
@@ -250,7 +277,8 @@ export class Records {
       const ixs = [];
       if (tape.resolved && !rec.stranded) ixs.push(await c.progBase.methods.settleRound().accountsPartial({ caller: c.house.publicKey, round: roundPda, tape: tapePda }).instruction());
       for (const k of chunk) { rec.claimAttemptAt.set(k.pubkey, Date.now()); ixs.push(await this.claimIx(tapePda, k)); }
-      const res = await c.sendBase(ixs, { label: `claim_call ${this.t}/${rec.n}` });
+      const first = new PublicKey(chunk[0].pubkey);
+      const res = await c.sendBase(ixs, { label: `claim_call ${this.t}/${rec.n}`, stillNeeded: async () => { const x = await c.baseRead.account(first); return !!x.data && !decodeCall(x.data).claimed; } });
       if (res.ok) rec.claims += chunk.length;
       for (const k of chunk) log.info("claim", { pool: this.t, round: rec.n, bettor: k.call.bettor, desk: k.call.desk, amount: k.call.amount, owedBefore: k.call.owed, ok: res.ok, sig: res.sig, err: res.ok ? undefined : errText(res), void: tape.void });
     }

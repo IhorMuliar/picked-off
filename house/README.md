@@ -32,10 +32,17 @@ to settlement on Solana.
    unclosed record from the chain and continues (mid-round, revealed, committed, unsettled,
    unclaimed, unclosed). No database is needed.
 
-Every base-layer transaction is sent with preflight on, so failing transactions never land. A base
-transaction with no status after `BASE_DROP_MS` (90 s) is waited on until its blockhash has expired
-(it can then no longer land) and is sent once more; a record is never created, and a Round never
-committed, twice at the same time.
+Every base-layer transaction is sent with preflight on, so failing transactions never land
+(`src/basesend.ts`). While it has no status, the same signed transaction (same signature, so it can
+execute at most once) is sent again every `BASE_REBROADCAST_MS` (2 s), until it is confirmed, fails,
+or its blockhash expires; only then is a new one signed, after re-reading the chain so that a
+transaction whose effect already happened is not sent again. A record is never created, and a Round
+never committed, twice at the same time; each record is driven on its own, so one slow transaction
+holds up no other record and no round.
+
+**Late record:** a round whose record is not confirmed when the round is due waits for it at most
+`RECORD_WAIT_MS` (6 s), or `RECORD_WAIT_PLAYER_MS` (15 s) with a player seated, then opens
+unrecorded; a create that still lands later is committed, settled (void) and closed like any record.
 
 **Low-balance guard:** the house balance is read every minute; below `MIN_BALANCE_SOL` (6 SOL on
 devnet) no new records are created (an error line `low_balance` every minute, `recording: false` in
@@ -77,6 +84,7 @@ make house-i13              # account-read check over the runner's log
 npx tsx house/test/restart.ts     # kill/restart test (local stack)
 npx tsx house/test/liveness.ts    # stalled crank → reschedule; stuck round → abort (local stack)
 npx tsx house/test/guards.ts      # offline: low-balance guard, single create/commit in flight, log rotation
+npx tsx house/test/rebroadcast.ts # offline: rebroadcast, expiry + rebuild, late record → unrecorded round, record pass
 npx tsx house/test/run-report.ts <house log>                 # rounds, timings, bots, records
 npx tsx house/test/wallet-report.ts <since ISO time> [house log]   # house wallet txs, failures, SOL spent
 ```

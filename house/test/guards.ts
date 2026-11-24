@@ -2,7 +2,7 @@
 //  1. low balance: below MIN_BALANCE_SOL no record is created and nothing is sent;
 //  2. one create_record per round at a time (a pipelined create and a direct one share the send);
 //  3. one commit_round per record at a time (the post-reveal commit and the background pass);
-//  4. config: devnet defaults (base endpoint, guard, drop timeout) and STATE_DIR-relative logs;
+//  4. config: devnet defaults (base endpoint, guard, rebroadcast and record-wait bounds, drop injection off) and STATE_DIR-relative logs;
 //  5. log rotation by size;
 //  6. soft balance rule: below SOFT_BALANCE_SOL a seated player makes a round recorded at most every
 //     LOW_RECORD_EVERY_SEC; above it every such round is recorded;
@@ -29,12 +29,13 @@ fs.writeFileSync(keyFile, JSON.stringify(Array.from(Keypair.generate().secretKey
 
 async function main() {
   const cfg = loadConfig({ CLUSTER: "devnet", HOUSE_KEYPAIR: keyFile, STATE_DIR: dir, BOT_KEYS_DIR: path.join(dir, "bots") });
-  check("devnet defaults", cfg.baseRpc === "https://rpc.magicblock.app/devnet" && cfg.minBalanceSol === 6 && cfg.baseDropMs === 90_000 && cfg.logFile === path.join(dir, "house-devnet.log"),
-    { baseRpc: cfg.baseRpc, minBalanceSol: cfg.minBalanceSol, baseDropMs: cfg.baseDropMs, logFile: cfg.logFile });
+  check("devnet defaults", cfg.baseRpc === "https://rpc.magicblock.app/devnet" && cfg.minBalanceSol === 6 && cfg.baseRebroadcastMs === 2_000 && cfg.recordWaitMs === 6_000 && cfg.recordWaitPlayerMs === 15_000 && cfg.injectDropEvery === 0 && cfg.logFile === path.join(dir, "house-devnet.log"),
+    { baseRpc: cfg.baseRpc, minBalanceSol: cfg.minBalanceSol, baseRebroadcastMs: cfg.baseRebroadcastMs, recordWaitMs: cfg.recordWaitMs, injectDropEvery: cfg.injectDropEvery, logFile: cfg.logFile });
 
   const chain = new Chain(cfg);
   let sends = 0;
   (chain as any).send = async () => { sends++; await new Promise((r) => setTimeout(r, 200)); return { sig: `s${sends}`, ms: 200, err: null, ok: true }; };
+  (chain as any).sendBase = (chain as any).send;
   (chain as any).ensureHouseToken = async () => {};
   chain.progEr = chain.program(chain.base, chain.house);
 

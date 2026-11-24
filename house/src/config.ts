@@ -53,8 +53,15 @@ export interface HouseConfig {
   /** the unseal waits until this long after the last bot send and after the bell (a late act must never land, or be
    *  delivered, once the round is public) */
   unsealQuietMs: number;
-  /** a base transaction with no status after this long (and an expired blockhash) counts as dropped and is sent again */
-  baseDropMs: number;
+  /** a base transaction with no status for this long is sent again (same signed bytes) until it lands or expires */
+  baseRebroadcastMs: number;
+  /** when its round is due to open, a record not confirmed yet is waited on this long; then the round opens
+   *  unrecorded (no player seated) */
+  recordWaitMs: number;
+  /** the same bound when a player is seated */
+  recordWaitPlayerMs: number;
+  /** test switch: skip the first network send of every Nth base transaction (it is still tracked and rebroadcast); 0 = off */
+  injectDropEvery: number;
 }
 
 const home = os.homedir();
@@ -86,7 +93,10 @@ function defaults(cluster: Cluster): HouseConfig {
     softBalanceSol: cluster === "local" ? 0 : 10,
     lowRecordEverySec: 120,
     unsealQuietMs: cluster === "local" ? 300 : 2_500,
-    baseDropMs: 90_000,
+    baseRebroadcastMs: 2_000,
+    recordWaitMs: 6_000,
+    recordWaitPlayerMs: 15_000,
+    injectDropEvery: 0,
   };
   if (cluster === "local")
     return {
@@ -119,7 +129,8 @@ const ENV: Record<string, [keyof HouseConfig, "s" | "n" | "b" | "list"]> = {
   MAX_ROUND_MS: ["maxRoundMs", "n"], COMMIT_WAIT_MS: ["commitWaitMs", "n"], TABLE_FLOAT_LAMPORTS: ["tableFloatLamports", "n"],
   ORACLE_QUEUE: ["oracleQueueFallback", "s"], HEALTH_PORT: ["healthPort", "n"], TEST_CALLS: ["testCalls", "b"], MAX_ROUNDS: ["maxRounds", "n"],
   BOTS: ["bots", "b"], INIT_CONFIG: ["initConfig", "b"], HOUSE_LOG: ["logFile", "s"], HOUSE_RPC_LOG: ["rpcLogFile", "s"],
-  HOUSE_LOG_MAX_MB: ["logMaxMb", "n"], HOUSE_LOG_KEEP: ["logKeep", "n"], HOUSE_STDOUT_INFO: ["stdoutInfo", "b"], MIN_BALANCE_SOL: ["minBalanceSol", "n"], SOFT_BALANCE_SOL: ["softBalanceSol", "n"], LOW_RECORD_EVERY_SEC: ["lowRecordEverySec", "n"], UNSEAL_QUIET_MS: ["unsealQuietMs", "n"], BASE_DROP_MS: ["baseDropMs", "n"],
+  HOUSE_LOG_MAX_MB: ["logMaxMb", "n"], HOUSE_LOG_KEEP: ["logKeep", "n"], HOUSE_STDOUT_INFO: ["stdoutInfo", "b"], MIN_BALANCE_SOL: ["minBalanceSol", "n"], SOFT_BALANCE_SOL: ["softBalanceSol", "n"], LOW_RECORD_EVERY_SEC: ["lowRecordEverySec", "n"], UNSEAL_QUIET_MS: ["unsealQuietMs", "n"],
+  BASE_REBROADCAST_MS: ["baseRebroadcastMs", "n"], RECORD_WAIT_MS: ["recordWaitMs", "n"], RECORD_WAIT_PLAYER_MS: ["recordWaitPlayerMs", "n"], HOUSE_INJECT_DROP_EVERY: ["injectDropEvery", "n"],
 };
 
 export function loadConfig(env = process.env): HouseConfig {

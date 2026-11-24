@@ -9,7 +9,7 @@ import { Bot, PERSONALITIES, SEAT_MIX, SEND_TIMEOUT_MS, seatName, type PoolView,
 import { Records } from "./records.ts";
 import { log } from "./log.ts";
 
-export interface PoolHealth { pool: number; round: number; phase: number; lastRoundAt: number; lastRoundAgeSec: number | null; stuck: boolean; rounds: number; aborts: number; reschedules: number; records: { outstanding: number[]; committed: number; closed: number; stranded: number; failedCommits: number }; bots: number; lateActs: Record<string, number>; sendsInflight: number; sendsAborted: number }
+export interface PoolHealth { pool: number; round: number; phase: number; lastRoundAt: number; lastRoundAgeSec: number | null; stuck: boolean; rounds: number; aborts: number; reschedules: number; records: { outstanding: number[]; committed: number; closed: number; stranded: number; failedCommits: number; driveAgeSec: number }; recordWait: { opens: number; meanMs: number; maxMs: number; over1s: number; lateUnrecorded: number }; bots: number; lateActs: Record<string, number>; sendsInflight: number; sendsAborted: number }
 
 // earliest next open = HIDE 5 s + the earliest bell after 20 beats of 1.5 s + LIGHTS ON; a pipelined record's
 // planned start is set to it, so its Tape calls close during the next round's live play
@@ -37,7 +37,12 @@ export class Pool implements PoolView {
   // per-round bookkeeping
   private unsealed = new Set<number>();
   private bellSeenAt = new Map<number, number>();
-  private openInfo = new Map<number, { at: number; openMs: number; resealMs: number; gapMs: number | null; recordSig?: string }>();
+  private openInfo = new Map<number, { at: number; openMs: number; resealMs: number; gapMs: number | null; recordSig?: string; recordWaitMs?: number; recordLate?: boolean }>();
+  // the wait for the next round's record (time from "due to open" to "record confirmed and visible", or to the
+  // decision to open unrecorded)
+  private recWait: { n: number; since: number; doneAt: number; late: boolean } | null = null;
+  readonly recordWaitStats = { opens: 0, totalMs: 0, maxMs: 0, over1s: 0 };
+  lateRecords = 0;
   private lastBellAt = 0;
   // players seated when a round opened (round → seat → key), and seats to hand back to a bot
   private humansAtOpen = new Map<number, Map<number, string>>();
@@ -67,7 +72,8 @@ export class Pool implements PoolView {
     const age = this.lastRoundAt ? Math.round((Date.now() - this.lastRoundAt) / 1000) : null;
     return { pool: this.tableId, round: t?.round ?? -1, phase: t?.phase ?? -1, lastRoundAt: this.lastRoundAt, lastRoundAgeSec: age, stuck: stuckFor > this.cfg.stallMs || (age !== null && age > 180),
       rounds: this.rounds, aborts: this.aborts, reschedules: this.reschedules,
-      records: { outstanding: this.records.outstanding, committed: this.records.committed, closed: this.records.closed, stranded: this.records.stranded, failedCommits: this.records.failedCommits },
+      records: { outstanding: this.records.outstanding, committed: this.records.committed, closed: this.records.closed, stranded: this.records.stranded, failedCommits: this.records.failedCommits, driveAgeSec: this.records.driveAgeSec },
+      recordWait: { opens: this.recordWaitStats.opens, meanMs: this.recordWaitStats.opens ? Math.round(this.recordWaitStats.totalMs / this.recordWaitStats.opens) : 0, maxMs: this.recordWaitStats.maxMs, over1s: this.recordWaitStats.over1s, lateUnrecorded: this.lateRecords },
       bots: this.bots.filter((b) => b?.running).length, lateActs: this.lateTotals, sendsInflight: this.sends.inflight, sendsAborted: this.sends.aborted };
   }
 
@@ -405,7 +411,7 @@ export class Pool implements PoolView {
     log.info("round", { pool: this.tableId, round: t.round, recorded: t.recorded, beats: t.beat, bellSlot: t.bellSlot, openSlot: t.openSlot,
       liveSlots: t.bellSlot && t.openSlot ? t.bellSlot - t.openSlot : null, fallbackSeed: t.fallbackSeed, tickCalls: t.tickCalls, resolves: t.resolves,
       roundMs, openMs: oi?.openMs, resealMs: oi?.resealMs, gapMs: oi?.gapMs, revealMs, commitMs, unsealMs,
-      botsQuietMs: this.lastQuiet?.quietMs, botsInflightAtUnseal: this.lastQuiet?.inflight, unsealForced: this.lastQuiet?.forced || undefined, sendsAborted: this.lastQuiet?.aborted, recordSig: oi?.recordSig, picked: t.picked,
+      botsQuietMs: this.lastQuiet?.quietMs, botsInflightAtUnseal: this.lastQuiet?.inflight, unsealForced: this.lastQuiet?.forced || undefined, sendsAborted: this.lastQuiet?.aborted, recordSig: oi?.recordSig, recordWaitMs: oi?.recordWaitMs, recordLate: oi?.recordLate, picked: t.picked,
       reschedules: this.progress.round === t.round ? this.progress.reschedules : 0, n: this.rounds });
     this.openInfo.delete(t.round);
     this.bellSeenAt.delete(t.round);
@@ -494,12 +500,30 @@ export class Pool implements PoolView {
     if (this.cfg.maxRounds && this.rounds >= this.cfg.maxRounds) return;
     if (this.cfg.bots && (await this.refillSeats(t))) { await this.fresh(); return; } // re-read the Table before going on
     const roundPda = c.pda.round(this.tableId, n);
-    // record: pipelined during the previous round, or created now (a player sat down, or the cadence is due)
-    await this.records.pendingCreate(n); // a record for n still being sent (pipelined): wait for it, never open past it
+    // record: pipelined during the previous round, or created now (a player sat down, or the cadence is due).
+    // A record that is not confirmed when its round is due is waited on for a bounded time only (`recordWaitMs`,
+    // `recordWaitPlayerMs` with a player seated); then the round opens unrecorded. A round is only ever opened
+    // against a Round that is confirmed on base, delegated and visible on the rollup.
+    if (this.recWait?.n !== n) this.recWait = { n, since: Date.now(), doneAt: 0, late: false };
+    const w = this.recWait;
     let rb = await c.baseRead.account(roundPda);
-    if (!rb.data && this.shouldRecord(t)) {
-      if (!(await this.records.create(n, Math.floor(Date.now() / 1000) - 2))) return;
+    if (!rb.data && !w.late && (this.records.isCreating(n) || this.shouldRecord(t))) {
+      const human = t.seats.some((x) => x.kind === SEAT.human);
+      const bound = human ? this.cfg.recordWaitPlayerMs : this.cfg.recordWaitMs;
+      if (!this.records.isCreating(n) && !this.records.has(n) && Date.now() - w.since < bound)
+        this.records.create(n, Math.floor(Date.now() / 1000) - 2).catch((e) => log.warn("record_create_error", { pool: this.tableId, round: n, err: String(e?.message ?? e) }));
+      while (this.records.isCreating(n) && Date.now() - w.since < bound && !this.stopped) await sleep(100);
       rb = await c.baseRead.account(roundPda);
+      if (!rb.data) {
+        if (this.records.has(n)) { await sleep(200); return; } // confirmed, not readable yet: read again
+        if (Date.now() - w.since < bound) { await sleep(1_000); return; } // refused at preflight: tried again within the bound
+        const inflight = this.records.isCreating(n);
+        this.records.abandonCreate(n);
+        w.late = true;
+        this.lateRecords++;
+        log.warn("record_late", { pool: this.tableId, round: n, waitedMs: Date.now() - w.since, boundMs: bound, playerSeated: human, createInFlight: inflight,
+          note: "record not confirmed in time: the round opens unrecorded; a create that still lands is committed, settled void and closed by the record pass" });
+      }
     }
     let recorded = false;
     if (rb.data) {
@@ -508,6 +532,7 @@ export class Pool implements PoolView {
       if ((await c.waitOwner(c.erRead, roundPda, 10_000)) === null) { log.warn("record_not_visible", { pool: this.tableId, round: n }); return; }
       const re = decodeRound((await c.erRead.account(roundPda)).data!);
       if (re.status !== ROUND_STATUS.created) { log.warn("record_not_fresh", { pool: this.tableId, round: n, status: re.status }); return; }
+      if (!w.doneAt) w.doneAt = Date.now();
       const wait = re.plannedStartUnix * 1000 - Date.now() + 1_000;
       if (wait > 0) { await sleep(Math.min(wait, 1_000)); return; }
       // open_round checks the planned start against the rollup's clock (within about a second of ours)
@@ -515,6 +540,7 @@ export class Pool implements PoolView {
       if (erNow !== null && erNow < re.plannedStartUnix) { await sleep(300); return; }
       recorded = true;
     }
+    if (!w.doneAt) w.doneAt = Date.now(); // no record waited on (unrecorded round, or decided late)
     // re-seal (setup_permissions, update path) every desk and the Book
     const t0 = performance.now();
     if (t.sealed !== SEAL_ALL) {
@@ -534,13 +560,18 @@ export class Pool implements PoolView {
     if (!r.ok) { log.warn("open_failed", { pool: this.tableId, round: n, err: errText(r) }); await sleep(500); return; }
     const openAt = Date.now();
     this.sendClosed = false;
+    const recordWaitMs = w.doneAt - w.since;
+    this.recordWaitStats.opens++;
+    this.recordWaitStats.totalMs += recordWaitMs;
+    this.recordWaitStats.maxMs = Math.max(this.recordWaitStats.maxMs, recordWaitMs);
+    if (recordWaitMs >= 1_000) this.recordWaitStats.over1s++;
     const humans = new Map<number, string>();
     t.seats.forEach((x, s) => { if (x.kind === SEAT.human) humans.set(s, x.key); });
     if (humans.size) this.humansAtOpen.set(n, humans);
     for (const r of [...this.humansAtOpen.keys()]) if (r < n - 3) this.humansAtOpen.delete(r);
-    this.openInfo.set(n, { at: openAt, openMs: Math.round(performance.now() - t1), resealMs, gapMs: this.lastBellAt ? Math.round(openAt - this.lastBellAt) : null, recordSig: recorded ? this.records.createSig(n) : undefined });
+    this.openInfo.set(n, { at: openAt, openMs: Math.round(performance.now() - t1), resealMs, gapMs: this.lastBellAt ? Math.round(openAt - this.lastBellAt) : null, recordSig: recorded ? this.records.createSig(n) : undefined, recordWaitMs, recordLate: w.late || undefined });
     this.progress = { round: n, resolves: 0, at: Date.now(), rescheduledDeadline: -1, reschedules: 0 };
-    log.info("round_open", { pool: this.tableId, round: n, recorded, sig: r.sig, resealMs });
+    log.info("round_open", { pool: this.tableId, round: n, recorded, sig: r.sig, resealMs, recordWaitMs, recordLate: w.late || undefined });
     // pipeline the next record so it is delegated and visible before its round opens
     const tNow = this.snap?.table ?? t;
     if (!(await c.baseRead.account(c.pda.round(this.tableId, n + 1))).data && this.shouldRecord(tNow, 50_000))

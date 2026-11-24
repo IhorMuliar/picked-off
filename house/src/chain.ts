@@ -14,6 +14,8 @@ import {
 } from "@magicblock-labs/ephemeral-rollups-sdk";
 import type { HouseConfig } from "./config.ts";
 import { log, RotatingFile } from "./log.ts";
+import { BaseSender, DEFAULT_TIMING, type BaseRpc, type Signed } from "./basesend.ts";
+import bs58 from "bs58";
 
 const { AnchorProvider, Program, Wallet, BN } = anchor;
 export { BN, Keypair, PublicKey, SystemProgram };
@@ -191,6 +193,41 @@ export class Chain {
     this.idl = JSON.parse(fs.readFileSync(path.join(REPO, "target", "idl", "ping.json"), "utf8"));
     if (this.idl.address !== this.programId.toBase58()) this.idl = { ...this.idl, address: this.programId.toBase58() };
     this.progBase = this.program(this.base, this.house);
+    const url = cfg.baseRpc;
+    const baseRpc: BaseRpc = {
+      sendRaw: async (bytes, preflight, maxRetries) => {
+        const r = await rpc(url, "sendTransaction", [Buffer.from(bytes).toString("base64"), { encoding: "base64", skipPreflight: !preflight, preflightCommitment: "confirmed", maxRetries }]);
+        if (typeof r.body?.result === "string") return { result: r.body.result };
+        if (r.body?.error) return { error: { message: String(r.body.error.message ?? JSON.stringify(r.body.error)), logs: r.body.error.data?.logs ?? null } };
+        return { network: String(r.body?.fetchError ?? `http ${r.http}`) };
+      },
+      status: async (sig, history) => {
+        const r = await rpc(url, "getSignatureStatuses", [[sig], { searchTransactionHistory: history }]);
+        const v = r.body?.result?.value;
+        return Array.isArray(v) ? (v[0] ?? null) : undefined;
+      },
+      blockHeight: async () => {
+        const r = await rpc(url, "getBlockHeight", [{ commitment: "confirmed" }]);
+        return typeof r.body?.result === "number" ? r.body.result : null;
+      },
+    };
+    // test switch, off unless set: HOUSE_INJECT_DROP_EVERY=N, or a file `inject-drop-every` holding N in the state dir
+    // (read at most every 5 s, so it can be turned on and off without a restart)
+    const dropFile = path.join(cfg.stateDir, "inject-drop-every");
+    let dropAt = 0, dropN = 0;
+    const dropEvery = () => {
+      if (cfg.injectDropEvery) return cfg.injectDropEvery;
+      if (Date.now() - dropAt > 5_000) {
+        dropAt = Date.now();
+        let v = 0;
+        try { v = Math.max(0, Math.floor(Number(fs.readFileSync(dropFile, "utf8").trim())) || 0); } catch { v = 0; }
+        if (v !== dropN) log.warn("base_drop_injection", { every: v, note: v ? "test switch on: the first network send of every Nth base transaction is skipped (it is still tracked and rebroadcast)" : "test switch off" });
+        dropN = v;
+      }
+      return dropN;
+    };
+    this.baseSender = new BaseSender(baseRpc, { ...DEFAULT_TIMING, rebroadcastMs: cfg.baseRebroadcastMs }, (level, ev, data) => log[level](ev, data), dropEvery);
+    if (cfg.injectDropEvery) log.warn("base_drop_injection", { every: cfg.injectDropEvery, note: "test switch on (HOUSE_INJECT_DROP_EVERY)" });
   }
 
   program(conn: Connection, payer: Keypair) {
@@ -232,9 +269,7 @@ export class Chain {
   isDelegatedOwner(owner?: string) { return owner === DELEGATION_PROGRAM_ID.toBase58(); }
 
   // ---------------------------------------------------------------- sending
-  /** Signs, sends and polls until confirmed or failed. Preflight is on unless asked otherwise.
-   *  `untilExpired`: keep polling past `timeoutMs` until the blockhash has expired, so a tx reported as
-   *  dropped can no longer land (a re-send can then never race the first copy). */
+  /** Rollup transactions: signs, sends and polls until confirmed or failed. Preflight is on unless asked otherwise. */
   async send(conn: Connection, ixs: TransactionInstruction[], signers: Keypair[], opts: { cu?: number; timeoutMs?: number; skipPreflight?: boolean; label?: string; untilExpired?: boolean } = {}): Promise<SendResult> {
     const tx = new Transaction();
     if (opts.cu) tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: opts.cu }));
@@ -275,25 +310,26 @@ export class Chain {
       await sleep(i < 50 ? 60 : 500);
     }
   }
-  /** Base transactions: preflight on; one with no status after `baseDropMs` (blockhash expired, so it can no
-   *  longer land) is sent once more with a fresh blockhash. */
-  async sendBase(ixs: TransactionInstruction[], opts: { cu?: number; label?: string; signers?: Keypair[] } = {}) {
-    this.baseTxs.sent++;
-    let r = await this.send(this.base, ixs, opts.signers ?? [this.house], { ...opts, skipPreflight: false, timeoutMs: this.cfg.baseDropMs, untilExpired: true });
-    if (r.err === "dropped") {
-      this.baseTxs.dropped++;
-      log.warn("base_tx_dropped", { label: opts.label, sig: r.sig, ms: Math.round(r.ms), note: "no status, blockhash expired: sent again" });
-      this.baseTxs.sent++;
-      r = await this.send(this.base, ixs, opts.signers ?? [this.house], { ...opts, skipPreflight: false, timeoutMs: this.cfg.baseDropMs, untilExpired: true });
-    }
-    if (!r.ok) {
-      // preflight refusals never land; a landed failure would show in the tx's status
-      if (r.err && typeof r.err !== "string") this.baseTxs.failedOnChain++;
-      else this.baseTxs.refused++;
-    }
-    return r;
+  /** Base transactions (`basesend.ts`): preflight on for the first send of every newly signed transaction; the
+   *  same signed bytes are rebroadcast every `baseRebroadcastMs` while there is no status, until confirmed, failed
+   *  or expired; only an expired one is rebuilt (after `stillNeeded`, when given, says its effect is not on chain). */
+  async sendBase(ixs: TransactionInstruction[], opts: { cu?: number; label?: string; signers?: Keypair[]; stillNeeded?: () => Promise<boolean>; abandoned?: () => boolean } = {}): Promise<SendResult> {
+    const signers = opts.signers ?? [this.house];
+    const build = async (): Promise<Signed> => {
+      const tx = new Transaction();
+      if (opts.cu) tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: opts.cu }));
+      tx.add(...ixs);
+      tx.feePayer = signers[0].publicKey;
+      const bh = await this.base.getLatestBlockhash("confirmed");
+      tx.recentBlockhash = bh.blockhash;
+      tx.sign(...signers);
+      return { bytes: tx.serialize(), sig: bs58.encode(tx.signature!), lastValidBlockHeight: bh.lastValidBlockHeight };
+    };
+    const r = await this.baseSender.send(build, { label: opts.label, stillNeeded: opts.stillNeeded, abandoned: opts.abandoned });
+    return { sig: r.sig, ms: r.ms, err: r.err, ok: r.ok, logs: r.logs ?? null };
   }
-  readonly baseTxs = { sent: 0, dropped: 0, refused: 0, failedOnChain: 0 };
+  readonly baseSender: BaseSender;
+  get baseTxs() { return this.baseSender.counters; }
   async sendEr(ixs: TransactionInstruction[], opts: { cu?: number; label?: string } = {}) {
     await this.ensureHouseToken();
     return this.send(this.er, ixs, [this.house], { ...opts, skipPreflight: false });
