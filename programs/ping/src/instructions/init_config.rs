@@ -10,7 +10,8 @@ use ephemeral_rollups_sdk::vrf::consts::{DEFAULT_EPHEMERAL_QUEUE, DEFAULT_EPHEME
 pub struct ConfigParams {
     pub house: Pubkey,
     pub tee_validator: Pubkey,
-    /// DEFAULT_EPHEMERAL_QUEUE on devnet; all-zero disables VRF (local only).
+    /// DEFAULT_EPHEMERAL_QUEUE on devnet; all-zero disables VRF (every round then uses the
+    /// flagged fallback seed); the VRF test queue is accepted by the `local` build only.
     pub vrf_queue: Pubkey,
     pub beat_slots: u64,
     pub hide_slots: u64,
@@ -29,14 +30,15 @@ pub struct ConfigParams {
 }
 
 fn apply(c: &mut Config, p: &ConfigParams) -> Result<()> {
-    require!(p.tee_validator == TEE_VALIDATOR || p.tee_validator == LOCAL_VALIDATOR, PingError::BadValidator);
-    require!(
-        p.vrf_queue == DEFAULT_EPHEMERAL_QUEUE || p.vrf_queue == DEFAULT_EPHEMERAL_TEST_QUEUE || p.vrf_queue == Pubkey::default(),
-        PingError::BadParam
-    );
+    require!(VALIDATORS.contains(&p.tee_validator), PingError::BadValidator);
+    // the rollup queue, or none (fallback seed); the test queue only in the local build
+    let test_queue = cfg!(feature = "local") && p.vrf_queue == DEFAULT_EPHEMERAL_TEST_QUEUE;
+    require!(p.vrf_queue == DEFAULT_EPHEMERAL_QUEUE || p.vrf_queue == Pubkey::default() || test_queue, PingError::BadParam);
     require!(p.house != Pubkey::default(), PingError::BadParam);
     require!(p.beat_slots >= 1 && p.beat_slots <= 10_000 && p.hide_slots >= 1 && p.hide_slots <= 100_000, PingError::BadParam);
-    require!(p.crank_interval_ms >= 10 && p.crank_iterations >= 1 && p.tick_cu_limit >= 10_000 && p.tick_cu_limit <= 1_400_000, PingError::BadParam);
+    // a crank outlives its round only by its iterations: at most ~42 min at 250 ms
+    require!(p.crank_interval_ms >= 10 && p.crank_iterations >= 1 && p.crank_iterations <= MAX_CRANK_ITERATIONS, PingError::BadParam);
+    require!(p.tick_cu_limit >= 10_000 && p.tick_cu_limit <= 1_400_000, PingError::BadParam);
     require!(p.bell_min >= 1 && p.bell_min <= p.bell_max && (p.bell_max as usize) <= MAX_LIVE_BEATS, PingError::BadParam);
     c.house = p.house;
     c.tee_validator = p.tee_validator;

@@ -20,6 +20,9 @@ idl-build = ["anchor-lang/idl-build"]
 anchor-debug = []
 custom-heap = []
 custom-panic = []
+# Local-stack build: also accepts the local test admin, the local validator identity and the
+# VRF test queue in the Config. Never enabled for a devnet deploy.
+local = []
 
 [dependencies]
 anchor-lang = "=1.0.2"

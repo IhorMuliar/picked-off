@@ -1,7 +1,8 @@
 //! Rollup: seat a labelled house bot at desk `seat` of a house pool. House only. Any time on an
 //! empty or bot-held seat; on a human's seat only between rounds (phase IDLE, REVEALED or
 //! ABORTED), which is how the house frees a seat whose player has gone (the house decides that
-//! off-chain). The Desk's permission is set to the bot key alone (flags 0).
+//! off-chain). The Desk's permission is set to the bot key alone (flags 0); a new key restarts
+//! `Desk.last_seq` at 0.
 use crate::constants::*;
 use crate::errors::PingError;
 use crate::state::*;
@@ -48,7 +49,14 @@ pub fn join_bot(ctx: Context<JoinBot>, seat: u8, key: Pubkey, personality: u8, n
         t.sealed |= 1u16 << seat;
         (t.table_id, t.seats[s])
     };
-    ctx.accounts.desk.load_mut()?.key = key;
+    {
+        let mut d = ctx.accounts.desk.load_mut()?;
+        // a new key starts its own seq run; the same bot re-seated keeps its count
+        if d.key != key {
+            d.last_seq = 0;
+        }
+        d.key = key;
+    }
     let seeds = account_seeds(KIND_DESK, table_id, seat as u64)?;
     let a = &ctx.accounts;
     set_permission(

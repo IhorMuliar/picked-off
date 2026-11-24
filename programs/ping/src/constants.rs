@@ -85,13 +85,22 @@ pub const TASK_DOMAIN: &[u8] = b"ping/task";
 // ---- deployment keys
 /// The TEE validator every delegation is pinned to on devnet.
 pub const TEE_VALIDATOR: Pubkey = pubkey!("MTEWGuqxUpYZGFJQcp8tLN7x5v9BSeoFHYWQQ3n3xzo");
-/// Identity of the local MagicBlock stack's validator (accepted for local test configs).
+/// Identity of the local MagicBlock stack's validator (accepted only by the `local` build).
 pub const LOCAL_VALIDATOR: Pubkey = pubkey!("mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev");
-/// Keys allowed to create the Config: the devnet deployer and the local test wallet.
-pub const ADMINS: [Pubkey; 2] = [
-    pubkey!("2PgaD2rF6U4a7urZ43GWMkKdhchjqqSmVgcX54GLRAYQ"),
-    pubkey!("4K5RjaJeaw7QVjvCJuU6DzV7H3GYnSScjtmMG3A2G9HZ"),
-];
+/// The devnet deployer: the only key allowed to create the Config in the default build.
+pub const DEVNET_ADMIN: Pubkey = pubkey!("2PgaD2rF6U4a7urZ43GWMkKdhchjqqSmVgcX54GLRAYQ");
+/// The local test wallet (accepted only by the `local` build).
+pub const LOCAL_ADMIN: Pubkey = pubkey!("4K5RjaJeaw7QVjvCJuU6DzV7H3GYnSScjtmMG3A2G9HZ");
+/// Keys allowed to create the Config.
+#[cfg(not(feature = "local"))]
+pub const ADMINS: [Pubkey; 1] = [DEVNET_ADMIN];
+#[cfg(feature = "local")]
+pub const ADMINS: [Pubkey; 2] = [DEVNET_ADMIN, LOCAL_ADMIN];
+/// Validators a Config may pin delegations to.
+#[cfg(not(feature = "local"))]
+pub const VALIDATORS: [Pubkey; 1] = [TEE_VALIDATOR];
+#[cfg(feature = "local")]
+pub const VALIDATORS: [Pubkey; 2] = [TEE_VALIDATOR, LOCAL_VALIDATOR];
 pub const COMPUTE_BUDGET_PROGRAM: Pubkey = pubkey!("ComputeBudget111111111111111111111111111111");
 pub const SLOT_HASHES_SYSVAR: Pubkey = pubkey!("SysvarS1otHashes111111111111111111111111111");
 
@@ -107,3 +116,5 @@ pub const TAPE_CLOSE_AFTER_SECS: i64 = 24 * 60 * 60;
 pub const VRF_WAIT_BEATS: u64 = 2;
 /// `reschedule_crank` is allowed once a deadline is this many beats overdue (3 s).
 pub const STALL_BEATS: u64 = 2;
+/// Upper bound on `Config.crank_iterations` (a crank never cancelled stops after this many ticks).
+pub const MAX_CRANK_ITERATIONS: u32 = 10_000;

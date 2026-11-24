@@ -1,6 +1,6 @@
 //! Rollup: call off the round in play (HIDE, LIVE or BELL): cancel its crank, phase ABORTED, the
-//! Round record (if any) ABORTED so its Tape refunds. Nothing is made public: the Book and Desks
-//! stay sealed and the next `open_round` resets them. House only.
+//! Round record (required for a recorded round) ABORTED so its Tape refunds. Nothing is made
+//! public: the Book and Desks stay sealed and the next `open_round` resets them. House only.
 use crate::constants::*;
 use crate::errors::PingError;
 use crate::state::*;
@@ -32,6 +32,8 @@ pub fn abort_round<'info>(ctx: Context<'info, AbortRound<'info>>) -> Result<()> 
         let t = ctx.accounts.table.load()?;
         require_house(&t.house, &ctx.accounts.house.key())?;
         require!(t.phase == PH_HIDE || t.phase == PH_LIVE || t.phase == PH_BELL, PingError::BadPhase);
+        // a recorded round must take its Round with it, or the record would stay OPEN for good
+        require!(t.recorded == 0 || ctx.accounts.round.is_some(), PingError::NoRecord);
         t.task_id
     };
     cancel_crank(&ctx.accounts.house, &ctx.accounts.magic_context, &ctx.accounts.magic_program, task)?;

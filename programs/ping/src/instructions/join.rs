@@ -8,8 +8,9 @@
 //! The seat becomes the burner's (kind human, its name), the Desk key is the burner, and the Desk
 //! permission is set to that one member with flags 0, in the same transaction: from then on the
 //! previous key can neither read the Desk nor act for it (its acts fail the key check and are
-//! no-ops). `Desk.last_seq` is kept: the new key continues above it. Nothing here touches the
-//! Book, so a takeover changes no hidden state and no compute cost of `act` or `tick`.
+//! no-ops). `Desk.last_seq` restarts at 0 for the new key, so a previous holder that pushed it
+//! to `u32::MAX` cannot leave the desk unable to act. Nothing here touches the Book, so a
+//! takeover changes no hidden state and no compute cost of `act` or `tick`.
 use crate::constants::*;
 use crate::errors::PingError;
 use crate::state::*;
@@ -59,6 +60,8 @@ pub fn join(ctx: Context<Join>, seat: u8, name: [u8; 16]) -> Result<()> {
     {
         let mut d = ctx.accounts.desk.load_mut()?;
         require!(d.table_id == table_id && d.index == seat, PingError::BadAccount);
+        // a new key starts its own seq run (the old key's acts already fail the key check)
+        d.last_seq = 0;
         d.key = key;
     }
     let seeds = account_seeds(KIND_DESK, table_id, seat as u64)?;

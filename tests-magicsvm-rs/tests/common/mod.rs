@@ -187,8 +187,12 @@ pub struct Env {
     nonce: u64,
 }
 
+/// The program under test: `target/deploy/ping.so` (the devnet build), or `$PING_SO`.
 pub fn deploy_so() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/deploy/ping.so")
+    match std::env::var_os("PING_SO") {
+        Some(p) => PathBuf::from(p),
+        None => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/deploy/ping.so"),
+    }
 }
 
 impl Env {
@@ -664,6 +668,320 @@ impl Cu {
     pub fn assert_constant(&self) {
         for (k, v) in &self.0 {
             assert_eq!(v.len(), 1, "CU class {k} is not constant: {v:?}\n{}", self.report());
+        }
+    }
+}
+
+// ====================================================================== negative-test helpers
+pub const DELEGATION_PROGRAM: Address = Address::from_str_const("DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh");
+pub const TEE_VALIDATOR: Address = Address::from_str_const("MTEWGuqxUpYZGFJQcp8tLN7x5v9BSeoFHYWQQ3n3xzo");
+pub const VRF_TEST_QUEUE: Address = Address::from_str_const("Sc9MJUngNbQXSXGP3F67KvKwVnhaYn6kcioxXNVowYT");
+
+/// Program error codes (`PingError`, Anchor offset 6000) and the Anchor framework codes used.
+pub mod code {
+    pub const NOT_ADMIN: u32 = 6000;
+    pub const NOT_HOUSE: u32 = 6001;
+    pub const BAD_PARAM: u32 = 6002;
+    pub const BAD_VALIDATOR: u32 = 6003;
+    pub const BAD_KIND: u32 = 6004;
+    pub const BAD_SEAT: u32 = 6005;
+    pub const BAD_ACCOUNT: u32 = 6006;
+    pub const BAD_PHASE: u32 = 6007;
+    pub const BAD_ROUND: u32 = 6008;
+    pub const NOT_SEALED: u32 = 6009;
+    pub const TOO_EARLY: u32 = 6010;
+    pub const SEAT_TAKEN: u32 = 6011;
+    pub const ALREADY_SEATED: u32 = 6012;
+    pub const ROUND_IN_PLAY: u32 = 6014;
+    pub const OVERFLOW: u32 = 6015;
+    pub const CALLS_CLOSED: u32 = 6017;
+    pub const BAD_DESK: u32 = 6018;
+    pub const NOT_SETTLED: u32 = 6019;
+    pub const TAPE_OPEN: u32 = 6020;
+    pub const NOT_STALLED: u32 = 6022;
+    pub const NO_RECORD: u32 = 6023;
+    pub const FALLBACK_NOT_FOUND: u32 = 101;
+    pub const CONSTRAINT_SIGNER: u32 = 2002;
+    pub const CONSTRAINT_SEEDS: u32 = 2006;
+    pub const CONSTRAINT_ADDRESS: u32 = 2012;
+    pub const DISCRIMINATOR_MISMATCH: u32 = 3002;
+    pub const WRONG_OWNER: u32 = 3007;
+    pub const NOT_INITIALIZED: u32 = 3012;
+}
+
+/// Asserts that `res` failed with program/Anchor error `code` (`Custom(code)`).
+#[track_caller]
+pub fn expect_code(res: Result<u64, String>, code: u32, what: &str) {
+    match res {
+        Ok(_) => panic!("{what}: succeeded, expected error {code}"),
+        Err(e) => {
+            let first = e.lines().next().unwrap_or("");
+            assert!(first.contains(&format!("Custom({code})")), "{what}: expected Custom({code}), got {first}\n{e}");
+        }
+    }
+}
+
+/// Asserts that `res` failed (any error); returns the first line of the error.
+#[track_caller]
+pub fn expect_fail(res: Result<u64, String>, what: &str) -> String {
+    match res {
+        Ok(_) => panic!("{what}: succeeded, expected a failure"),
+        Err(e) => e.lines().next().unwrap_or("").to_string(),
+    }
+}
+
+pub fn meta_w(a: Address) -> AccountMeta {
+    AccountMeta::new(a, false)
+}
+pub fn meta_r(a: Address) -> AccountMeta {
+    AccountMeta::new_readonly(a, false)
+}
+pub fn meta_ws(a: Address) -> AccountMeta {
+    AccountMeta::new(a, true)
+}
+pub fn meta_rs(a: Address) -> AccountMeta {
+    AccountMeta::new_readonly(a, true)
+}
+
+/// Borsh `ConfigParams` (156 bytes); the fields not listed get the devnet values.
+#[derive(Clone, Copy)]
+pub struct CfgParams {
+    pub house: Address,
+    pub tee_validator: Address,
+    pub vrf_queue: Address,
+    pub beat_slots: u64,
+    pub hide_slots: u64,
+    pub crank_iterations: u32,
+}
+impl CfgParams {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(self.house.as_ref());
+        d.extend_from_slice(self.tee_validator.as_ref());
+        d.extend_from_slice(self.vrf_queue.as_ref());
+        for v in [self.beat_slots, self.hide_slots, 10_000_000u64, 1_000_000u64] {
+            d.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [250u32, self.crank_iterations, 400_000, 250, 5, 15] {
+            d.extend_from_slice(&v.to_le_bytes());
+        }
+        d.extend_from_slice(&[20, 29, 4, 10]);
+        assert_eq!(d.len(), 156);
+        d
+    }
+}
+
+impl Env {
+    /// Sends one transaction and returns its logs (or the error with logs).
+    pub fn send_logs(&mut self, target: TransactionTarget, payer: &Keypair, ixs: &[Instruction]) -> Result<(u64, Vec<String>), String> {
+        let tx = Transaction::new(&[payer], Message::new(ixs, Some(&payer.pubkey())), self.svm.latest_blockhash_for(target));
+        let res = self.svm.send_transaction_to(target, tx);
+        self.svm.expire_blockhash_for(target);
+        match res {
+            Ok(meta) => Ok((meta.compute_units_consumed, meta.logs.clone())),
+            Err(f) => Err(format!("{:?}\n{:#?}", f.err, f.meta.logs)),
+        }
+    }
+
+    /// A funded fresh key.
+    pub fn funded(&mut self, lamports: u64) -> Keypair {
+        let k = Keypair::new();
+        self.svm.airdrop(&k.pubkey(), lamports).unwrap();
+        k
+    }
+
+    pub fn base_unix(&self) -> i64 {
+        self.svm.base().get_sysvar::<solana_clock::Clock>().unix_timestamp
+    }
+
+    /// Sets the base layer's unix time (the slot and the rollup clock are left alone).
+    pub fn set_base_unix(&mut self, unix: i64) {
+        let mut c = self.svm.base().get_sysvar::<solana_clock::Clock>();
+        c.unix_timestamp = unix;
+        self.svm.base_mut().set_sysvar(&c);
+    }
+
+    pub fn lamports(&self, t: TransactionTarget, a: &Address) -> u64 {
+        match t {
+            Base => self.svm.base().get_account(a).map(|x| x.lamports).unwrap_or(0),
+            Er => self.svm.ephemeral().get_account(a).or_else(|| self.svm.base().get_account(a)).map(|x| x.lamports).unwrap_or(0),
+        }
+    }
+
+    pub fn exists(&self, t: TransactionTarget, a: &Address) -> bool {
+        self.lamports(t, a) > 0
+    }
+
+    /// Overwrites bytes of a base-layer account in place.
+    pub fn patch_base(&mut self, a: &Address, off: usize, bytes: &[u8]) {
+        let mut acc = self.svm.get_account_for(Base, a).unwrap_or_else(|| panic!("missing {a}"));
+        acc.data[off..off + bytes.len()].copy_from_slice(bytes);
+        self.svm.set_account(*a, acc).unwrap();
+    }
+
+    /// Creates an account on base with the given owner and data and delegates it to the rollup.
+    pub fn delegated_fake(&mut self, owner: Address, data: Vec<u8>) -> Address {
+        let a = Keypair::new().pubkey();
+        self.svm.set_account(a, Account { lamports: 10_000_000, data, owner, executable: false, rent_epoch: 0 }).unwrap();
+        self.svm.delegate_account(a).unwrap();
+        a
+    }
+
+    /// The members of `target`'s permission on the rollup: (private, [(flags, key)]).
+    pub fn permission(&self, target: &Address) -> Option<(bool, Vec<(u8, Address)>)> {
+        let p = permission_pda(target);
+        let acc = self.svm.ephemeral().get_account(&p).or_else(|| self.svm.base().get_account(&p))?;
+        if acc.owner != PERMISSION_PROGRAM || acc.data.len() < 35 {
+            return None;
+        }
+        let private = acc.data[34] == 1;
+        let members = acc.data[35..].chunks_exact(33).map(|c| (c[0], Address::try_from(&c[1..33]).unwrap())).collect();
+        Some((private, members))
+    }
+
+    pub fn fee_vault(&self) -> Address {
+        Address::find_program_address(&[b"magic-fee-vault", self.svm.validator_identity().as_ref()], &DELEGATION_PROGRAM).0
+    }
+
+    // ---------------------------------------------------------------- more instructions
+    pub fn ix_create_pool_kind(&self, payer: &Address, id: u64, kind: u8) -> Instruction {
+        let mut ix = self.ix_create_pool(id);
+        ix.data[16] = kind;
+        ix.accounts[0].pubkey = *payer;
+        ix
+    }
+
+    pub fn ix_create_record_at(&self, payer: &Address, pool: &Pool, n: u64, planned: i64) -> Instruction {
+        let mut ix = self.ix_create_record(pool, n);
+        ix.data[24..32].copy_from_slice(&planned.to_le_bytes());
+        ix.accounts[0].pubkey = *payer;
+        ix
+    }
+
+    pub fn ix_delegate(&self, payer: &Address, kind: u8, id: u64, index: u64, pda_acc: Address, validator: Address) -> Instruction {
+        let mut data = disc("delegate").to_vec();
+        data.push(kind);
+        data.extend_from_slice(&id.to_le_bytes());
+        data.extend_from_slice(&index.to_le_bytes());
+        let buffer = Address::find_program_address(&[b"buffer", pda_acc.as_ref()], &PROGRAM).0;
+        let record = Address::find_program_address(&[b"delegation", pda_acc.as_ref()], &DELEGATION_PROGRAM).0;
+        let meta = Address::find_program_address(&[b"delegation-metadata", pda_acc.as_ref()], &DELEGATION_PROGRAM).0;
+        Instruction {
+            program_id: PROGRAM,
+            accounts: vec![
+                meta_ws(*payer),
+                meta_r(self.config),
+                meta_w(buffer),
+                meta_w(record),
+                meta_w(meta),
+                meta_w(pda_acc),
+                meta_r(validator),
+                meta_r(PROGRAM),
+                meta_r(DELEGATION_PROGRAM),
+                meta_r(SYSTEM),
+            ],
+            data,
+        }
+    }
+
+    pub fn ix_init_config(&self, admin: &Address, p: &CfgParams) -> Instruction {
+        let mut data = disc("init_config").to_vec();
+        data.extend_from_slice(&p.encode());
+        Instruction { program_id: PROGRAM, accounts: vec![meta_ws(*admin), meta_w(self.config), meta_r(SYSTEM)], data }
+    }
+
+    pub fn ix_update_config(&self, admin: &Address, p: &CfgParams) -> Instruction {
+        let mut data = disc("update_config").to_vec();
+        data.extend_from_slice(&p.encode());
+        Instruction { program_id: PROGRAM, accounts: vec![meta_rs(*admin), meta_w(self.config)], data }
+    }
+
+    pub fn ix_settle(caller: &Address, round: Address, tape: Address) -> Instruction {
+        Instruction { program_id: PROGRAM, accounts: vec![meta_rs(*caller), meta_r(round), meta_w(tape)], data: disc("settle_round").to_vec() }
+    }
+
+    pub fn call_pda(tape: &Address, bettor: &Address) -> Address {
+        pda(&[b"call", tape.as_ref(), bettor.as_ref()]).0
+    }
+
+    pub fn ix_place_call(&self, bettor: &Address, tape: Address, desk: u8) -> Instruction {
+        let mut data = disc("place_call").to_vec();
+        data.push(desk);
+        Instruction {
+            program_id: PROGRAM,
+            accounts: vec![meta_ws(*bettor), meta_r(self.config), meta_w(tape), meta_w(Env::call_pda(&tape, bettor)), meta_r(SYSTEM)],
+            data,
+        }
+    }
+
+    pub fn ix_claim(caller: &Address, tape: Address, call: Address, bettor: Address) -> Instruction {
+        Instruction {
+            program_id: PROGRAM,
+            accounts: vec![meta_ws(*caller), meta_w(tape), meta_w(call), meta_w(bettor)],
+            data: disc("claim_call").to_vec(),
+        }
+    }
+
+    pub fn ix_close_round(&self, house: &Address, round: Address, tape: Address) -> Instruction {
+        Instruction {
+            program_id: PROGRAM,
+            accounts: vec![meta_ws(*house), meta_r(self.config), meta_w(round), meta_w(tape)],
+            data: disc("close_round").to_vec(),
+        }
+    }
+
+    pub fn ix_commit_round(&self, house: &Address, pool: &Pool, round: Address, n: u64) -> Instruction {
+        let mut data = disc("commit_round").to_vec();
+        data.extend_from_slice(&n.to_le_bytes());
+        Instruction {
+            program_id: PROGRAM,
+            accounts: vec![meta_ws(*house), meta_w(pool.table), meta_w(round), meta_w(self.fee_vault()), meta_r(MAGIC_PROGRAM), meta_w(MAGIC_CONTEXT)],
+            data,
+        }
+    }
+
+    pub fn ix_abort_round(&self, house: &Address, pool: &Pool, round: Option<u64>) -> Instruction {
+        let mut accounts = vec![meta_ws(*house), meta_w(pool.table), meta_w(pool.book)];
+        accounts.push(match round {
+            Some(n) => meta_w(pool.round_pda(n)),
+            None => meta_r(PROGRAM),
+        });
+        accounts.push(meta_w(MAGIC_CONTEXT));
+        accounts.push(meta_r(MAGIC_PROGRAM));
+        Instruction { program_id: PROGRAM, accounts, data: disc("abort_round").to_vec() }
+    }
+
+    /// Creates a pool on base only (Table, Book, Ledger, 8 Desks), nothing delegated.
+    pub fn base_pool(&mut self, id: u64) -> Pool {
+        let h = self.house.insecure_clone();
+        self.ok(Base, &h, &[], &[self.ix_create_pool(id)], "create_pool");
+        for i in 0..8u8 {
+            self.ok(Base, &h, &[], &[self.ix_create_desk(id, i)], "create_desk");
+        }
+        Env::pool_ids(id)
+    }
+
+    /// The addresses of pool `id` (fresh bot keys, nothing created).
+    pub fn pool_ids(id: u64) -> Pool {
+        let idb = id.to_le_bytes();
+        Pool {
+            id,
+            table: pda(&[b"table", &idb]).0,
+            book: pda(&[b"book", &idb]).0,
+            ledger: pda(&[b"ledger", &idb]).0,
+            desks: core::array::from_fn(|i| pda(&[b"desk", &idb, &[i as u8]]).0),
+            bots: (0..8).map(|_| Keypair::new()).collect(),
+            seq: [1; 8],
+        }
+    }
+
+    /// Plays the open round to the bell with ticks alone (for pools whose beats take 0 slots).
+    pub fn tick_to_bell(&mut self, pool: &Pool) {
+        let mut n = 0;
+        while self.er(&pool.table)[off::table::PHASE] != BELL {
+            self.tick(pool);
+            n += 1;
+            assert!(n < 200, "no bell");
         }
     }
 }
