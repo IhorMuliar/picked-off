@@ -163,6 +163,11 @@ export interface TapeView {
   paid?: number | "refund";
   /** Chain driver: a call or claim needs devnet SOL on this browser's key first. */
   needsFunding?: boolean;
+  /** Chain driver: this round has a Tape (a recorded round). */
+  recorded?: boolean;
+  /** Chain driver: local epoch ms at which the program starts refusing calls (Tape.close_unix on the base clock);
+   *  null while unknown. Absent (mock driver): the window follows the beats. */
+  closesAt?: number | null;
 }
 
 export interface RevealAction {

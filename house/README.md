@@ -9,11 +9,14 @@ to settlement on Solana.
    `delegate` ×10 (one account per transaction, pinned validator), `setup_permissions` for the
    Table, the Book and each Desk on the rollup, `join_bot` for the eight seats.
 2. **Every round**, driven only from what the chain says:
-   - recorded rounds: `create_record` + `delegate` of the Round in one base transaction, pipelined
-     during the previous round so it is visible on the rollup before its round opens;
+   - recorded rounds: `create_record` + `delegate` of the Round in one base transaction, sent when the
+     previous round's bell is seen, with a planned start equal to when the round will really open (the end
+     of LIGHTS ON plus the measured re-seal time, `src/schedule.ts`), so its Tape closes at live beat 10;
    - re-seal (`setup_permissions` for the Book and the Desks), `open_round` (reset, VRF request,
      crank scheduled with `ScheduleCrankCpi`);
-   - a recorded round opens only once the rollup's clock has reached the record's planned start;
+   - a recorded round opens at the record's planned start: not before (the program refuses it until the
+     rollup's clock reaches it), and not later than the re-seal makes it; each `round_open` line logs how
+     late it opened (`openLateMs`) and the resulting Tape window error (`tapeWindowErrMs`);
    - watch the crank's ticks to the bell; `reveal` (cancels the crank), then for a recorded round
      `commit_round` at once (the Round alone, `commit_and_undelegate`; before the unseal, so the record
      is back on base about 3 s after the bell), then `unseal`; the round stays public for

@@ -7,7 +7,7 @@
  * Tape and sends calls on the base layer, and after the bell replays the committed round
  * record in the browser and checks it against the published commit hash.
  */
-import { Keypair, PublicKey, Transaction, type Connection, type TransactionInstruction } from "@solana/web3.js";
+import { Keypair, PublicKey, SYSVAR_CLOCK_PUBKEY, Transaction, type Connection, type TransactionInstruction } from "@solana/web3.js";
 import {
   BEAT_MS, DESKS, LEVELS, LIGHTS_MS, TAPE_CLOSE_BEAT,
   type GameActions, type GameDriver, type MyDesk, type PeekProbe, type Phase, type StoreWriter, type TapeView,
@@ -26,6 +26,7 @@ import { joinIx, placeCallIx, claimCallIx, settleRoundIx } from "./ix";
 import { ACT_PING, ACT_REQUOTE } from "./wire";
 import { bellChance, buildReveal, printsOfBeat, recordFromBook, resultsOfBeat, seatsView, SKIM_STEP } from "./views";
 import { runPeek } from "./peek";
+import { baseClockOffsetMs, canStartCall, closesAtLocal, sendGuarded, WindowClosed, type ClockSample } from "./tapewindow";
 import { StatusBanner, type Banner } from "./status";
 import type { FromWorker, ToWorker } from "./actsender";
 import type { CadenceStats, Plan } from "./scheduler";
@@ -150,6 +151,9 @@ class ChainDriver implements GameDriver {
   private tape: Tape | null = null;
   private call: Call | null = null;
   private needsFunding = false;
+  /** base-layer clock − local clock (ms), measured once from the Clock sysvar; null until measured */
+  private baseOffsetMs: number | null = null;
+  private baseOffsetP: Promise<number | null> | null = null;
   private pendingClaims = new Map<string, { t: bigint; n: bigint; calledAt: number; tries: number }>();
   private claiming = false;
   private dripping = false;
@@ -263,6 +267,7 @@ class ChainDriver implements GameDriver {
     this.every(1000, () => this.refreshBanner());
     this.every(5000, () => void this.checkClaims());
     void this.loadConfig();
+    void this.baseOffset();
     // 3. find the pool
     while (!this.stopped && this.tableId === null) {
       await this.pickTable();
@@ -291,6 +296,32 @@ class ChainDriver implements GameDriver {
     } catch {
       /* the Tape check reads it again when needed */
     }
+  }
+
+  /** Base clock − local clock (ms) from three readings of the base layer's Clock sysvar; measured once (retried
+   *  on the next call while it fails). The Tape window is counted on this clock, never on the local one alone. */
+  private baseOffset(): Promise<number | null> {
+    if (this.baseOffsetMs !== null) return Promise.resolve(this.baseOffsetMs);
+    this.baseOffsetP ??= (async () => {
+      const samples: ClockSample[] = [];
+      for (let i = 0; i < 3; i++) {
+        const sentAt = Date.now();
+        const a = await this.base.connection.getAccountInfo(SYSVAR_CLOCK_PUBKEY, "processed").catch(() => null);
+        const recvAt = Date.now();
+        if (a && a.data.length >= 40) samples.push({ unix: Number(new DataView(a.data.buffer, a.data.byteOffset, a.data.byteLength).getBigInt64(32, true)), sentAt, recvAt });
+      }
+      this.baseOffsetMs = baseClockOffsetMs(samples);
+      this.baseOffsetP = null;
+      if (this.baseOffsetMs !== null) this.w.set({ tape: this.tapeView() });
+      return this.baseOffsetMs;
+    })();
+    return this.baseOffsetP;
+  }
+
+  /** Local epoch ms at which the program starts refusing calls on the current Tape; null when unknown. */
+  private tapeClosesAt(): number | null {
+    if (!this.tape || this.baseOffsetMs === null) return null;
+    return closesAtLocal(Number(this.tape.closeUnix), this.baseOffsetMs);
   }
 
   private async pickTable() {
@@ -462,7 +493,7 @@ class ChainDriver implements GameDriver {
       reveal: null,
       results: [],
       me: this.myDesk,
-      tape: { pool: new Array(DESKS).fill(0), closeBeat: TAPE_CLOSE_BEAT, myCall: null, needsFunding: this.needsFunding },
+      tape: { pool: new Array(DESKS).fill(0), closeBeat: TAPE_CLOSE_BEAT, myCall: null, needsFunding: this.needsFunding, recorded: t.recorded !== 0, closesAt: null },
       table: { ...s.table, prints: [] },
     }));
     this.unwatch("tape");
@@ -797,7 +828,7 @@ class ChainDriver implements GameDriver {
         if (!c) break;
         this.announceJoin = true;
         try {
-          await this.sendTx(c, [joinIx(this.pdas, tid, seat, this.me, this.playerLabel)], false);
+          await this.sendRollupTx(c, [joinIx(this.pdas, tid, seat, this.me, this.playerLabel)]);
         } catch (e) {
           this.joinErrors.push(`seat ${seat}: ${(e as Error).message}`.slice(0, 240));
           if (this.joinErrors.length > 8) this.joinErrors.shift();
@@ -826,14 +857,24 @@ class ChainDriver implements GameDriver {
     if (d) this.onTable(d);
   }
 
-  /** Sign with the burner and send; resolves with the signature once confirmed (or throws). */
-  private async sendTx(c: Connection, ixs: TransactionInstruction[], preflight: boolean): Promise<string> {
+  /** Sign with the burner and send on the base layer, preflight always on (against the newest state, so a tx the
+   *  program would refuse is refused by the RPC, never landed); resolves once confirmed (or throws). `gate`: sent
+   *  (and re-sent) only while it holds. */
+  private async sendTx(c: Connection, ixs: TransactionInstruction[], gate?: () => boolean): Promise<string> {
     const tx = new Transaction().add(...ixs);
     tx.feePayer = this.me;
     tx.recentBlockhash = (await c.getLatestBlockhash("confirmed")).blockhash;
     tx.sign(Keypair.fromSecretKey(this.burner.secretKey));
-    // preflight against the newest state, so a tx another party has just made invalid is refused, not landed
-    const sig = await c.sendRawTransaction(tx.serialize(), { skipPreflight: !preflight, preflightCommitment: "processed", maxRetries: 3 });
+    return sendGuarded(c, tx.serialize(), { gate });
+  }
+
+  /** Sign with the burner and send on the private rollup (no preflight there, as before); resolves once confirmed. */
+  private async sendRollupTx(c: Connection, ixs: TransactionInstruction[]): Promise<string> {
+    const tx = new Transaction().add(...ixs);
+    tx.feePayer = this.me;
+    tx.recentBlockhash = (await c.getLatestBlockhash("confirmed")).blockhash;
+    tx.sign(Keypair.fromSecretKey(this.burner.secretKey));
+    const sig = await c.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 3 });
     for (let i = 0; i < 60; i++) {
       const st = await c.getSignatureStatuses([sig]).catch(() => null);
       const v = st?.value?.[0];
@@ -862,7 +903,7 @@ class ChainDriver implements GameDriver {
       const onTop = tp.pool[this.revealTop];
       paid = onTop > 0n ? Number(tp.total) / Number(onTop) : "refund";
     }
-    return { pool, closeBeat: TAPE_CLOSE_BEAT, myCall: this.myCallDesk, paid, needsFunding: this.needsFunding };
+    return { pool, closeBeat: TAPE_CLOSE_BEAT, myCall: this.myCallDesk, paid, needsFunding: this.needsFunding, recorded: !!this.table?.recorded, closesAt: this.tapeClosesAt() };
   }
 
   private onTape(d: Uint8Array | null) {
@@ -934,15 +975,33 @@ class ChainDriver implements GameDriver {
     this.keepSeat = true;
     if (!t || this.tableId === null || this.round === null || desk < 0 || desk >= DESKS || this.myCallDesk !== null) return;
     if (!t.recorded) return this.flash("no Tape on this round");
-    if (t.phase >= PHASE.bell || (t.phase === PHASE.live && t.beat >= TAPE_CLOSE_BEAT)) return this.flash("the Tape is closed");
+    if (t.phase >= PHASE.bell) return this.flash("calls closed for this round");
+    const round = this.round;
+    // the window is the program's: Tape.close_unix on the base clock. A call (and the drip before it) starts only
+    // with MIN_CALL_LEAD_MS left, and is sent only while that still holds
+    if (!this.tape || this.tape.round !== round) {
+      const d = await this.base.get(this.pdas.tape(this.tableId, round)).catch(() => null);
+      if (d && isAccount(d, "Tape") && this.round === round) this.tape = decodeTape(d);
+    }
+    await this.baseOffset();
+    const open = () => {
+      const at = this.round === round ? this.tapeClosesAt() : null;
+      return at !== null && canStartCall(at - Date.now());
+    };
+    if (!open()) return this.flash(this.tapeClosesAt() === null ? "could not read the Tape's closing time: try again" : "calls closed for this round");
     if (!this.config) await this.loadConfig();
     const callLamports = Number(this.config?.callLamports ?? 10_000_000n);
     const rent = await this.base.connection.getMinimumBalanceForRentExemption(CALL_ACCOUNT_BYTES);
     const need = callLamports + rent + BASE_FEE_RESERVE;
     if (!(await this.funded(need)) && !(await this.drip(need))) return;
-    const round = this.round;
-    if (this.round === null || this.myCallDesk !== null) return;
-    await this.sendTx(this.base.connection, [placeCallIx(this.pdas, this.tableId, round, this.me, desk)], true);
+    if (this.round !== round || this.myCallDesk !== null) return;
+    if (!open()) return this.flash("calls closed for this round · your devnet SOL stays for the next one");
+    try {
+      await this.sendTx(this.base.connection, [placeCallIx(this.pdas, this.tableId, round, this.me, desk)], open);
+    } catch (e) {
+      if (e instanceof WindowClosed) return this.flash("calls closed for this round · your devnet SOL stays for the next one");
+      throw e;
+    }
     this.pendingClaims.set(`${this.tableId}:${round}`, { t: this.tableId, n: round, calledAt: now(), tries: 0 });
     if (this.round === round) {
       this.myCallDesk = desk;
@@ -986,7 +1045,7 @@ class ChainDriver implements GameDriver {
   private async claim(t: bigint, n: bigint) {
     if (!(await this.funded(BASE_FEE_RESERVE))) throw new Error("no SOL for the fee");
     // client rule: settle_round and claim_call in the same transaction
-    await this.sendTx(this.base.connection, [settleRoundIx(this.pdas, t, n, this.me), claimCallIx(this.pdas, t, n, this.me, this.me)], true);
+    await this.sendTx(this.base.connection, [settleRoundIx(this.pdas, t, n, this.me), claimCallIx(this.pdas, t, n, this.me, this.me)]);
     this.flash("Tape call settled and claimed");
   }
 

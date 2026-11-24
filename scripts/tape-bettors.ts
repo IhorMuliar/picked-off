@@ -117,8 +117,8 @@ async function bet(pool: number, round: number) {
   console.log(`${v.pass ? "PASS" : "FAIL"} tape pool ${pool} round ${round} ${v.kind} desks ${desks} winner ${last?.winner} paid ${v.sumPaid}/${v.tape?.total}`);
 }
 
-// calls close at the round's planned start + 20 s, and a round may open later than planned: call on the Tape of the
-// coming round as soon as its record exists (the house creates it during the round before)
+// calls close at the round's planned start + 20 s (the house opens the round at its planned start): call on the Tape
+// of the coming round as soon as its record exists (the house creates it at the bell of the round before)
 for (const p of pools) {
   const poll = new TablePoll(p, pda.table(p), 250);
   const tried = new Set<number>();

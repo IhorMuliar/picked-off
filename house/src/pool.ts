@@ -1,19 +1,17 @@
 // One house pool: one-time setup, then rounds back to back on the rollup, driven only from chain
 // state (so a restart continues from whatever phase the pool is in):
-//   [record: create_record + delegate on base, pipelined during the previous round] → re-seal →
-//   open_round → crank ticks to the bell (liveness: reschedule a stalled crank, abort a stuck round) →
+//   [record: create_record + delegate on base, sent at the previous round's bell] → re-seal →
+//   open_round at the record's planned start → crank ticks to the bell (liveness: reschedule a stalled crank, abort a stuck round) →
 //   reveal → unseal → LIGHTS ON → next round; recorded rounds go on to commit → settle → claims → close.
 import bs58 from "bs58";
 import { Chain, BN, PublicKey, rpc, ACT_DISC, KIND, PHASE, SEAT, SEAL_ALL, NDESK, ROUND_STATUS, decodeTable, decodeConfig, decodeRound, decodeDesk, errText, must, sleep, type TableView } from "./chain.ts";
 import { Bot, PERSONALITIES, SEAT_MIX, SEND_TIMEOUT_MS, seatName, type PoolView, type Snapshot, type SendTrack } from "./bots.ts";
 import { Records } from "./records.ts";
 import { log } from "./log.ts";
+import { LeadEstimator, OpenStats, MIN_PIPELINE_LEAD_MS, openTiming, openWaitMs, plannedFromBell, plannedLate } from "./schedule.ts";
 
-export interface PoolHealth { pool: number; round: number; phase: number; lastRoundAt: number; lastRoundAgeSec: number | null; stuck: boolean; rounds: number; aborts: number; reschedules: number; records: { outstanding: number[]; committed: number; closed: number; stranded: number; failedCommits: number; driveAgeSec: number }; recordWait: { opens: number; meanMs: number; maxMs: number; over1s: number; lateUnrecorded: number }; bots: number; lateActs: Record<string, number>; sendsInflight: number; sendsAborted: number }
+export interface PoolHealth { pool: number; round: number; phase: number; lastRoundAt: number; lastRoundAgeSec: number | null; stuck: boolean; rounds: number; aborts: number; reschedules: number; records: { outstanding: number[]; committed: number; closed: number; stranded: number; failedCommits: number; driveAgeSec: number }; recordWait: { opens: number; meanMs: number; maxMs: number; over1s: number; lateUnrecorded: number }; recordedOpen: OpenStats["summary"] & { leadEstMs: number }; bots: number; lateActs: Record<string, number>; sendsInflight: number; sendsAborted: number }
 
-// earliest next open = HIDE 5 s + the earliest bell after 20 beats of 1.5 s + LIGHTS ON; a pipelined record's
-// planned start is set to it, so its Tape calls close during the next round's live play
-const MIN_ROUND_SECS = 35;
 // a round's unseal waits for every bot send to settle; past this time after the bell it unseals anyway (and says so)
 const UNSEAL_HARD_BOUND_MS = 6 * SEND_TIMEOUT_MS;
 
@@ -37,7 +35,12 @@ export class Pool implements PoolView {
   // per-round bookkeeping
   private unsealed = new Set<number>();
   private bellSeenAt = new Map<number, number>();
-  private openInfo = new Map<number, { at: number; openMs: number; resealMs: number; gapMs: number | null; recordSig?: string; recordWaitMs?: number; recordLate?: boolean }>();
+  private openInfo = new Map<number, { at: number; openMs: number; resealMs: number; gapMs: number | null; recordSig?: string; recordWaitMs?: number; recordLate?: boolean; openLateMs?: number; tapeWindowErrMs?: number }>();
+  // planned starts (src/schedule.ts): the record of round n+1 is created at the bell of round n
+  readonly lead = new LeadEstimator();
+  readonly openStats = new OpenStats();
+  private tapeLeadSecs = 20; // Config.hide_secs + Config.tape_close_secs (read in setup)
+  private pipelined = new Set<number>();
   // the wait for the next round's record (time from "due to open" to "record confirmed and visible", or to the
   // decision to open unrecorded)
   private recWait: { n: number; since: number; doneAt: number; late: boolean } | null = null;
@@ -74,6 +77,7 @@ export class Pool implements PoolView {
       rounds: this.rounds, aborts: this.aborts, reschedules: this.reschedules,
       records: { outstanding: this.records.outstanding, committed: this.records.committed, closed: this.records.closed, stranded: this.records.stranded, failedCommits: this.records.failedCommits, driveAgeSec: this.records.driveAgeSec },
       recordWait: { opens: this.recordWaitStats.opens, meanMs: this.recordWaitStats.opens ? Math.round(this.recordWaitStats.totalMs / this.recordWaitStats.opens) : 0, maxMs: this.recordWaitStats.maxMs, over1s: this.recordWaitStats.over1s, lateUnrecorded: this.lateRecords },
+      recordedOpen: { ...this.openStats.summary, leadEstMs: Math.round(this.lead.value) },
       bots: this.bots.filter((b) => b?.running).length, lateActs: this.lateTotals, sendsInflight: this.sends.inflight, sendsAborted: this.sends.aborted };
   }
 
@@ -161,6 +165,7 @@ export class Pool implements PoolView {
     const conf = decodeConfig((await c.baseRead.account(c.pda.config())).data!);
     if (conf.house !== c.house.publicKey.toBase58()) throw new Error(`Config.house ${conf.house} is not this runner's key ${c.house.publicKey.toBase58()}`);
     if (conf.teeValidator !== c.validator.toBase58()) throw new Error(`Config.tee_validator ${conf.teeValidator} differs from VALIDATOR ${c.validator.toBase58()}`);
+    this.tapeLeadSecs = conf.hideSecs + conf.tapeCloseSecs;
 
     for (let s = 0; s < NDESK; s++) this.botKeys[s] = new Bot(c, this, s, PERSONALITIES[SEAT_MIX[s]], this.cfg.botKeysDir).key.publicKey.toBase58();
 
@@ -290,6 +295,7 @@ export class Pool implements PoolView {
     const c = this.chain;
     this.sendClosed = true;
     if (!this.bellSeenAt.has(t.round)) this.bellSeenAt.set(t.round, Date.now() - Math.max(0, this.nowSlotAge(this.snap!, t.bellSlot || this.snap!.slot)));
+    this.pipelineRecord(t, this.bellSeenAt.get(t.round)!);
     const ix = await c.progEr.methods.reveal().accountsPartial({ caller: c.house.publicKey, table: this.table, book: this.book, round: t.recorded ? c.pda.round(this.tableId, t.round) : null }).instruction();
     const t0 = performance.now();
     const r = await c.sendEr([ix], { cu: 400_000 });
@@ -411,7 +417,7 @@ export class Pool implements PoolView {
     log.info("round", { pool: this.tableId, round: t.round, recorded: t.recorded, beats: t.beat, bellSlot: t.bellSlot, openSlot: t.openSlot,
       liveSlots: t.bellSlot && t.openSlot ? t.bellSlot - t.openSlot : null, fallbackSeed: t.fallbackSeed, tickCalls: t.tickCalls, resolves: t.resolves,
       roundMs, openMs: oi?.openMs, resealMs: oi?.resealMs, gapMs: oi?.gapMs, revealMs, commitMs, unsealMs,
-      botsQuietMs: this.lastQuiet?.quietMs, botsInflightAtUnseal: this.lastQuiet?.inflight, unsealForced: this.lastQuiet?.forced || undefined, sendsAborted: this.lastQuiet?.aborted, recordSig: oi?.recordSig, recordWaitMs: oi?.recordWaitMs, recordLate: oi?.recordLate, picked: t.picked,
+      botsQuietMs: this.lastQuiet?.quietMs, botsInflightAtUnseal: this.lastQuiet?.inflight, unsealForced: this.lastQuiet?.forced || undefined, sendsAborted: this.lastQuiet?.aborted, recordSig: oi?.recordSig, recordWaitMs: oi?.recordWaitMs, recordLate: oi?.recordLate, openLateMs: oi?.openLateMs, tapeWindowErrMs: oi?.tapeWindowErrMs, picked: t.picked,
       reschedules: this.progress.round === t.round ? this.progress.reschedules : 0, n: this.rounds });
     this.openInfo.delete(t.round);
     this.bellSeenAt.delete(t.round);
@@ -422,6 +428,7 @@ export class Pool implements PoolView {
     if (!this.unsealed.has(t.round)) {
       const ri = this.revealInfo.get(t.round);
       if (!this.bellSeenAt.has(t.round)) this.bellSeenAt.set(t.round, Date.now() - Math.max(0, this.nowSlotAge(s, t.bellSlot)));
+      this.pipelineRecord(t, this.bellSeenAt.get(t.round)!); // a runner resumed after the reveal
       const unsealMs = await this.tryUnseal(t.round); // idempotent on a resumed, already public round
       if (unsealMs === null) { await sleep(100); return; } // a bot send still unsettled: try again on the next tick
       if (ri) { this.revealInfo.delete(t.round); this.finishRound(t, ri.revealMs, unsealMs, ri.commitMs); }
@@ -460,6 +467,26 @@ export class Pool implements PoolView {
     if (human) return !this.chain.lowBalance() || since >= this.cfg.lowRecordEverySec * 1000;
     return since >= this.cfg.recordEverySec * 1000;
   }
+  /** At the bell of round t.round: create the record of the next round (if the cadence wants one), with the planned
+   *  start at which that round will open (bell + LIGHTS ON + the measured re-seal lead). Once per round; skipped when
+   *  too little time is left (a runner resumed late in LIGHTS ON): the round's due-time create covers it. */
+  private pipelineRecord(t: TableView, bellAt: number) {
+    const n = t.round + 1;
+    if (this.pipelined.has(n)) return;
+    this.pipelined.add(n);
+    for (const x of [...this.pipelined]) if (x < n - 5) this.pipelined.delete(x);
+    if (this.cfg.maxRounds && this.rounds + 1 >= this.cfg.maxRounds) return;
+    const planned = plannedFromBell(bellAt, this.cfg.lightsOnMs, this.lead.value);
+    const leadMs = planned * 1000 - Date.now();
+    if (leadMs < MIN_PIPELINE_LEAD_MS || !this.shouldRecord(t, leadMs)) return;
+    if (this.records.isCreating(n) || this.records.has(n)) return;
+    void (async () => {
+      if ((await this.chain.baseRead.account(this.chain.pda.round(this.tableId, n))).data) return;
+      log.info("record_planned", { pool: this.tableId, round: n, planned, msToPlanned: planned * 1000 - Date.now(), leadEstMs: Math.round(this.lead.value) });
+      await this.records.create(n, planned);
+    })().catch((e) => log.warn("record_pipeline_error", { pool: this.tableId, round: n, err: String(e?.message ?? e) }));
+  }
+
   /** Waits until the Table poll is newer than now (or `pred` holds). */
   private async fresh(pred: (t: TableView) => boolean = () => true, ms = 3_000) {
     const since = Date.now();
@@ -511,7 +538,7 @@ export class Pool implements PoolView {
       const human = t.seats.some((x) => x.kind === SEAT.human);
       const bound = human ? this.cfg.recordWaitPlayerMs : this.cfg.recordWaitMs;
       if (!this.records.isCreating(n) && !this.records.has(n) && Date.now() - w.since < bound)
-        this.records.create(n, Math.floor(Date.now() / 1000) - 2).catch((e) => log.warn("record_create_error", { pool: this.tableId, round: n, err: String(e?.message ?? e) }));
+        this.records.create(n, plannedLate(Date.now())).catch((e) => log.warn("record_create_error", { pool: this.tableId, round: n, err: String(e?.message ?? e) }));
       while (this.records.isCreating(n) && Date.now() - w.since < bound && !this.stopped) await sleep(100);
       rb = await c.baseRead.account(roundPda);
       if (!rb.data) {
@@ -525,7 +552,7 @@ export class Pool implements PoolView {
           note: "record not confirmed in time: the round opens unrecorded; a create that still lands is committed, settled void and closed by the record pass" });
       }
     }
-    let recorded = false;
+    let recorded = false, planned = 0;
     if (rb.data) {
       if (!c.isDelegatedOwner(rb.owner)) { log.warn("record_not_delegated", { pool: this.tableId, round: n }); return; }
       this.records.track(n);
@@ -533,12 +560,8 @@ export class Pool implements PoolView {
       const re = decodeRound((await c.erRead.account(roundPda)).data!);
       if (re.status !== ROUND_STATUS.created) { log.warn("record_not_fresh", { pool: this.tableId, round: n, status: re.status }); return; }
       if (!w.doneAt) w.doneAt = Date.now();
-      const wait = re.plannedStartUnix * 1000 - Date.now() + 1_000;
-      if (wait > 0) { await sleep(Math.min(wait, 1_000)); return; }
-      // open_round checks the planned start against the rollup's clock (within about a second of ours)
-      const erNow = await c.erUnix().catch(() => null);
-      if (erNow !== null && erNow < re.plannedStartUnix) { await sleep(300); return; }
       recorded = true;
+      planned = re.plannedStartUnix;
     }
     if (!w.doneAt) w.doneAt = Date.now(); // no record waited on (unrecorded round, or decided late)
     // re-seal (setup_permissions, update path) every desk and the Book
@@ -553,6 +576,25 @@ export class Pool implements PoolView {
       }
     }
     const resealMs = Math.round(performance.now() - t0);
+    // ready to open: learn the lead from the end of LIGHTS ON to here on recorded rounds (it feeds the next planned
+    // starts); only when this round's step began right at the end of LIGHTS ON (not after a resume or a late unseal)
+    const lightsEnd = this.lastBellAt + this.cfg.lightsOnMs;
+    if (recorded && this.lastBellAt && w.since >= lightsEnd - 500 && w.since <= lightsEnd + 1_000) this.lead.observe(Date.now() - lightsEnd);
+    // a recorded round opens at its planned start, not before: the runner's clock first, then the rollup's
+    // (open_round checks it there; both read within a second of ours, in whole seconds)
+    let openWaitedMs = 0;
+    if (recorded) {
+      const w0 = Date.now();
+      while (!this.stopped) {
+        const ms = openWaitMs(planned, Date.now());
+        if (ms > 0) { await sleep(Math.min(ms, 1_000)); continue; }
+        const erNow = await c.erUnix().catch(() => null);
+        if (erNow !== null && erNow < planned) { await sleep(100); continue; }
+        break;
+      }
+      openWaitedMs = Date.now() - w0;
+      if (this.stopped) return;
+    }
     const queue = t.vrfQueue.equals(PublicKey.default) ? new PublicKey(this.cfg.oracleQueueFallback) : t.vrfQueue;
     const ix = await c.progEr.methods.openRound(new BN(n)).accountsPartial({ house: c.house.publicKey, table: this.table, book: this.book, ...this.deskAccs(), round: recorded ? roundPda : null, oracleQueue: queue }).instruction();
     const t1 = performance.now();
@@ -560,6 +602,8 @@ export class Pool implements PoolView {
     if (!r.ok) { log.warn("open_failed", { pool: this.tableId, round: n, err: errText(r) }); await sleep(500); return; }
     const openAt = Date.now();
     this.sendClosed = false;
+    const timing = recorded ? openTiming(planned, openAt, this.tapeLeadSecs) : null;
+    if (timing) this.openStats.add(timing.openLateMs);
     const recordWaitMs = w.doneAt - w.since;
     this.recordWaitStats.opens++;
     this.recordWaitStats.totalMs += recordWaitMs;
@@ -569,13 +613,11 @@ export class Pool implements PoolView {
     t.seats.forEach((x, s) => { if (x.kind === SEAT.human) humans.set(s, x.key); });
     if (humans.size) this.humansAtOpen.set(n, humans);
     for (const r of [...this.humansAtOpen.keys()]) if (r < n - 3) this.humansAtOpen.delete(r);
-    this.openInfo.set(n, { at: openAt, openMs: Math.round(performance.now() - t1), resealMs, gapMs: this.lastBellAt ? Math.round(openAt - this.lastBellAt) : null, recordSig: recorded ? this.records.createSig(n) : undefined, recordWaitMs, recordLate: w.late || undefined });
+    this.openInfo.set(n, { at: openAt, openMs: Math.round(performance.now() - t1), resealMs, gapMs: this.lastBellAt ? Math.round(openAt - this.lastBellAt) : null, recordSig: recorded ? this.records.createSig(n) : undefined, recordWaitMs, recordLate: w.late || undefined, openLateMs: timing?.openLateMs, tapeWindowErrMs: timing?.tapeWindowErrMs });
     this.progress = { round: n, resolves: 0, at: Date.now(), rescheduledDeadline: -1, reschedules: 0 };
-    log.info("round_open", { pool: this.tableId, round: n, recorded, sig: r.sig, resealMs, recordWaitMs, recordLate: w.late || undefined });
-    // pipeline the next record so it is delegated and visible before its round opens
-    const tNow = this.snap?.table ?? t;
-    if (!(await c.baseRead.account(c.pda.round(this.tableId, n + 1))).data && this.shouldRecord(tNow, 50_000))
-      this.records.create(n + 1, Math.floor(openAt / 1000) + MIN_ROUND_SECS + Math.floor(this.cfg.lightsOnMs / 1000)).catch((e) => log.warn("record_pipeline_error", { pool: this.tableId, round: n + 1, err: String(e?.message ?? e) }));
+    log.info("round_open", { pool: this.tableId, round: n, recorded, sig: r.sig, resealMs, recordWaitMs, recordLate: w.late || undefined,
+      ...(timing ? { planned, openLateMs: timing.openLateMs, openWaitedMs, tapeCloseUnix: timing.closeUnix, tapeWindowErrMs: timing.tapeWindowErrMs, leadEstMs: Math.round(this.lead.value) } : {}) });
+    if (timing && timing.openLateMs > 1_500) log.warn("open_after_planned", { pool: this.tableId, round: n, planned, openLateMs: timing.openLateMs, note: "the round opened late against its record: its Tape closes that much before live beat 10 (the client shows the real close)" });
     // wait until the poller has seen the new round
     for (let i = 0; i < 40 && (this.snap?.table.round ?? 0) < n; i++) await sleep(50);
   }

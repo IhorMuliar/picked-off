@@ -1,10 +1,11 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useGame } from "../state/store";
 import { actions } from "../state/runtime";
 import { DESKS, lots } from "../state/types";
 import { Glyph } from "./glyphs";
 import { odds } from "./format";
 import { sfx, unlockAudio } from "../fx/sound";
+import { canStartCall, remainingMs, windowLabel } from "../chain/tapewindow";
 
 function DeskRow({ i }: { i: number }) {
   const seat = useGame((s) => s.table.seats[i]);
@@ -55,26 +56,46 @@ function Desks() {
   );
 }
 
+/** Re-renders every 250 ms while `on` (the chain window counts down on its own clock, not per beat). */
+function useTicker(on: boolean) {
+  const [, set] = useState(0);
+  useEffect(() => {
+    if (!on) return;
+    const id = setInterval(() => set((x) => x + 1), 250);
+    return () => clearInterval(id);
+  }, [on]);
+}
+
 function Tape() {
   const tape = useGame((s) => s.tape);
   const seats = useGame((s) => s.table.seats);
   const clock = useGame((s) => s.clock);
   const reveal = useGame((s) => s.reveal);
   const total = tape.pool.reduce((a, b) => a + b, 0);
-  const open = clock.phase === "hide" || (clock.phase === "live" && clock.beat <= tape.closeBeat);
+  const inPlay = clock.phase === "hide" || clock.phase === "live";
+  const chainWindow = tape.closesAt !== undefined;
+  useTicker(chainWindow && inPlay);
+  let open: boolean;
+  let label: string;
+  if (chainWindow) {
+    // the program's window: Tape.close_unix on the base clock; a call starts only with MIN_CALL_LEAD_MS left
+    const rem = tape.closesAt != null ? remainingMs(tape.closesAt, Date.now()) : null;
+    open = inPlay && !!tape.recorded && rem !== null && canStartCall(rem);
+    label = !tape.recorded ? "no Tape this round" : rem === null ? "reading the Tape…" : !inPlay ? "calls closed" : windowLabel(rem);
+  } else {
+    open = clock.phase === "hide" || (clock.phase === "live" && clock.beat <= tape.closeBeat);
+    const n = tape.closeBeat - clock.beat + 1;
+    label = clock.phase === "hide" ? "calls open" : open ? `closes in ${n} beat${n === 1 ? "" : "s"}` : "calls closed";
+  }
   let right: string;
   if (clock.phase === "lights" && reveal && tape.paid !== undefined)
     right = tape.paid === "refund" ? "nobody called it · refunded" : `paid ${tape.paid.toFixed(1)}×`;
-  else if (clock.phase === "hide") right = "calls open";
-  else if (open) {
-    const n = tape.closeBeat - clock.beat + 1;
-    right = `closes in ${n} beat${n === 1 ? "" : "s"}`;
-  } else right = "calls closed";
+  else right = label;
   return (
     <section className="panel tape" data-testid="tape">
       <div className="ph">
         <span>The Tape · call the Top Desk</span>
-        <span className="mono">{right}</span>
+        <span className="mono" data-testid="tape-window">{right}</span>
       </div>
       {seats.map((s, i) => (
         <div className="row" key={i}>
