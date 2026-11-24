@@ -57,7 +57,7 @@ export async function runPeek(n: PeekRead, ctx: PeekContext): Promise<PeekResult
       if (r.http !== 200 || r.body?.error) no(errText(r.http, r.body));
       else if (!r.value) no("value: null (not on the base layer)");
       else {
-        const zero = r.data!.subarray(40).every((x) => x === 0);
+        const zero = r.data!.subarray(40, 40 + 1144).every((x) => x === 0); // the embedded round state
         (zero ? no : ok)(`owner ${r.value.owner.slice(0, 8)}… · ${r.data!.length} bytes · ${zero ? "hidden state all zero (never committed)" : "hidden state bytes present"}`);
       }
       break;

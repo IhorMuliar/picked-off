@@ -14,7 +14,7 @@ import {
 } from "../state/types";
 import { chainConfig, type ChainConfig } from "./config";
 import { loadOrCreateBurner, exportBurner, storage, TokenStore, type Burner } from "./burner";
-import { BaseLink, TeeLink, closeSocket } from "./link";
+import { BaseLink, TeeLink, dropSocket } from "./link";
 import { watchAccount, type Watch } from "./watch";
 import { SlotClock } from "./slotclock";
 import { Pdas } from "./pda";
@@ -59,6 +59,14 @@ export interface ChainStatus {
   ackP50: number | null;
   ackP95: number | null;
   ackN: number;
+  /** scheduled beat close (deadline slot) -> own Desk result received, ms */
+  resultLagP50: number | null;
+  resultLagP95: number | null;
+  resultLagN: number;
+  deskActs: number | null;
+  deskLastSeq: number | null;
+  lastSentSeq: number | null;
+  joinErrors: string[];
   slotMs: number;
   needsFunding: boolean;
   watches: Record<string, { pushes: number; polls: number; resubscribes: number }>;
@@ -105,6 +113,11 @@ class ChainDriver implements GameDriver {
   private lastActSig: string | null = null;
   private sentAt = new Map<number, number>();
   private acks: number[] = [];
+  private lags: number[] = [];
+  private lastSentSeq: number | null = null;
+  private joinErrors: string[] = [];
+  private myCallDesk: number | null = null;
+  private revealTop: number | null = null;
   private ackedSeq = 0;
   private cadence: CadenceStats | null = null;
   private sendFailed = 0;
@@ -117,13 +130,17 @@ class ChainDriver implements GameDriver {
   private claimTried = new Set<string>();
   private note: { text: string; until: number } | null = null;
   private readonly playerLabel: string;
+  /** Idle seat release: a round with no player input lets the seat go at the next round. */
+  private keepSeat = false;
+  private released = false;
+  private seatedRound: bigint | null = null;
 
   readonly actions: GameActions = {
     place: (l) => this.place(l),
     ping: (l) => this.ping(l),
     requote: (l) => this.requote(l),
     tapeCall: (d) => void this.tapeCall(d).catch((e) => this.flash(`call failed: ${(e as Error).message}`)),
-    join: () => void this.joinFlow(),
+    join: () => this.join(),
   };
 
   readonly peek: PeekProbe = {
@@ -174,7 +191,7 @@ class ChainDriver implements GameDriver {
         this.tokens.invalidate();
         void this.tee.reauth();
       },
-      killWs: () => closeSocket(this.tee.connection),
+      killWs: () => dropSocket(this.tee.connection),
     };
     void this.boot().catch((e) => this.fail(e));
   }
@@ -321,10 +338,10 @@ class ChainDriver implements GameDriver {
     this.w.set((s) => ({
       ready: true,
       table: {
-        ...s.table, pool: String(t.tableId).padStart(4, "0"), round: Number(t.round), seats: seatsView(t), mySeat: this.seat,
+        ...s.table, pool: String(t.tableId).padStart(4, "0"), round: Number(t.round), seats: seatsView(t), mySeat: this.released ? null : this.seat,
         lastPings: counts[0], lastFills: counts[1], source: this.cfg.cluster,
       },
-      canJoin: this.seat === null && t.kind === TABLE_KIND.house,
+      canJoin: (this.seat === null || this.released) && t.kind === TABLE_KIND.house,
       clock: this.clockOf(t),
     }));
     this.updatePlan();
@@ -352,12 +369,20 @@ class ChainDriver implements GameDriver {
 
   private newRound(t: Table, first: boolean) {
     this.round = t.round;
+    if (!first && this.seat !== null && !this.released && !this.keepSeat && this.seatedRound !== null && t.round - this.seatedRound >= 2n) {
+      // nobody touched this desk for a whole round: stop acting so the house can give the seat back to a bot
+      this.released = true;
+      this.myDesk = null;
+    }
+    this.keepSeat = false;
     // joining mid-round: do not replay old beats as fresh results
     this.seenTableBeat = first || t.phase !== PHASE.hide ? t.beat : 0;
     this.seenDeskBeat = this.seenTableBeat;
     this.bellAt = t.phase >= PHASE.bell ? now() : null;
     this.tape = null;
     this.call = null;
+    this.myCallDesk = null;
+    this.revealTop = null;
     if (this.myDesk) this.myDesk = { ...this.freshMe(), level: this.myDesk.level };
     this.w.set((s) => ({
       reveal: null,
@@ -383,7 +408,7 @@ class ChainDriver implements GameDriver {
   private setMe(p: Partial<MyDesk>) {
     if (!this.myDesk) return;
     this.myDesk = { ...this.myDesk, ...p };
-    this.w.set({ me: this.myDesk });
+    if (!this.released) this.w.set({ me: this.myDesk });
   }
 
   private takeSeat(idx: number) {
@@ -392,6 +417,8 @@ class ChainDriver implements GameDriver {
     this.seat = idx;
     this.desk = null;
     this.deskReadable = false;
+    this.released = false;
+    this.seatedRound = this.round;
     this.myDesk = this.freshMe();
     this.w.set((s) => ({ me: null, canJoin: false, table: { ...s.table, mySeat: idx } }));
     const key = this.pdas.desk(this.tableId, idx);
@@ -404,6 +431,7 @@ class ChainDriver implements GameDriver {
 
   private loseSeat() {
     this.unwatch("desk");
+    this.released = false;
     this.seat = null;
     this.desk = null;
     this.deskReadable = false;
@@ -435,6 +463,11 @@ class ChainDriver implements GameDriver {
     this.ensureWorker(d);
     this.post({ type: "seqFloor", floor: d.lastSeq });
     this.trackAcks(d.lastSeq);
+    if (this.released) {
+      this.seenDeskBeat = Math.max(this.seenDeskBeat, Math.min(d.beat, 29));
+      this.updatePlan();
+      return;
+    }
     if (!this.myDesk) this.myDesk = this.freshMe();
 
     if (t && d.round === t.round) {
@@ -451,6 +484,10 @@ class ChainDriver implements GameDriver {
         }
         // anchor the measured number on this beat's scheduled close (its deadline slot)
         const close = this.timeOf(t.hideEndSlot + BigInt(b) * t.beatSlots);
+        if (b === top) {
+          this.lags.push(now() - close);
+          if (this.lags.length > 1000) this.lags.shift();
+        }
         this.w.set((s) => ({ clock: { ...s.clock, liveStartedAt: close - b * BEAT_MS } }));
         for (const res of resultsOfBeat(b, r)) {
           if (res.kind === "pickedoff") {
@@ -538,6 +575,7 @@ class ChainDriver implements GameDriver {
   private onWorker(m: FromWorker) {
     if (m.type === "sent") {
       const r = m.r;
+      this.lastSentSeq = r.seq;
       if (r.ok) {
         this.lastActSig = r.signature;
         this.sentAt.set(r.seq, r.at);
@@ -562,7 +600,7 @@ class ChainDriver implements GameDriver {
   private canSend(): boolean {
     const t = this.table;
     const d = this.desk;
-    if (!t || !d || this.seat === null || !this.deskReadable) return false;
+    if (!t || !d || this.seat === null || !this.deskReadable || this.released) return false;
     if (t.phase !== PHASE.hide && t.phase !== PHASE.live) return false;
     if (t.seats[this.seat]?.key !== this.burner.address || d.round !== t.round) return false;
     const deskSealed = (t.sealed >> this.seat) & 1;
@@ -587,19 +625,22 @@ class ChainDriver implements GameDriver {
   /* ================================================================ actions */
 
   private place(level: number) {
+    if (this.myDesk && !this.released) this.keepSeat = true;
     if (!this.myDesk || this.table?.phase !== PHASE.hide || level < 1 || level > LEVELS) return;
     this.post({ type: "choose", kind: ACT_REQUOTE, level });
     this.setMe({ level });
   }
 
   private ping(level: number) {
+    if (this.myDesk && !this.released) this.keepSeat = true;
     if (!this.myDesk || this.table?.phase !== PHASE.live || level < 1 || level > LEVELS) return;
     this.post({ type: "choose", kind: ACT_PING, level });
     this.setMe({ pending: { kind: "ping", level } });
   }
 
   private requote(level: number | null) {
-    if (!this.myDesk) return;
+    if (!this.myDesk || this.released) return;
+    this.keepSeat = true;
     const own = this.myDesk.level;
     const pickLevel = () => {
       const marks = this.myDesk!.marks;
@@ -615,36 +656,79 @@ class ChainDriver implements GameDriver {
     this.setMe({ pending: { kind: "requote", level: L } });
   }
 
+  private join() {
+    this.keepSeat = true;
+    if (this.seat !== null && this.released) {
+      // the seat is still ours on chain: take it back without a transaction
+      this.released = false;
+      this.seatedRound = this.round;
+      this.myDesk = this.desk ? { ...this.freshMe(), level: this.desk.level, resting: this.desk.resting, picked: this.desk.picked, nextAlgo: this.desk.nextAlgo } : this.freshMe();
+      this.w.set((s) => ({ me: this.myDesk, canJoin: false, table: { ...s.table, mySeat: this.seat } }));
+      this.updatePlan();
+      return;
+    }
+    void this.joinFlow();
+  }
+
   private async joinFlow() {
-    const t = this.table;
-    if (this.joining || this.seat !== null || !t || this.tableId === null) return;
-    if (t.kind !== TABLE_KIND.house) return;
+    if (this.joining || this.seat !== null || !this.table || this.tableId === null) return;
+    if (this.table.kind !== TABLE_KIND.house) return;
+    const tid = this.tableId;
     this.joining = true;
     this.refreshBanner();
+    const tried = new Set<number>();
     try {
-      const order = [...t.seats.keys()].filter((i) => t.seats[i].kind === SEAT.empty).concat([...t.seats.keys()].filter((i) => t.seats[i].kind === SEAT.bot));
-      for (const seat of order.slice(0, 3)) {
-        if (this.stopped || this.seat !== null) return;
-        const c = this.tee.connection;
-        if (!c) return;
-        this.announceJoin = true;
-        try {
-          await this.sendTx(c, [joinIx(this.pdas, this.tableId, seat, this.me, this.playerLabel)], false);
-        } catch {
+      // seats are refused during BELL / ABORTED (a short window): wait it out and retry
+      for (let attempt = 0; attempt < 120 && !this.stopped && this.seat === null; attempt++) {
+        const t = this.table!;
+        if (tried.size >= 8) {
+          // every seat refused this time (e.g. a phase the program does not seat in): start over shortly
+          tried.clear();
+          await sleep(1500);
+          await this.refreshTable(tid);
           continue;
         }
-        for (let i = 0; i < 25 && !this.stopped; i++) {
-          await sleep(200);
-          const d = await this.tee.get(this.pdas.table(this.tableId)).catch(() => null);
-          if (d) this.onTable(d);
-          if (this.seat !== null) return;
+        if (t.phase === PHASE.bell || t.phase === PHASE.aborted) {
+          await sleep(500);
+          await this.refreshTable(tid);
+          continue;
         }
+        const free = (k: number) => [...t.seats.keys()].filter((i) => t.seats[i].kind === k && !tried.has(i));
+        const seat = free(SEAT.empty)[0] ?? free(SEAT.bot)[0];
+        if (seat === undefined) {
+          for (let i = 0; i < 8; i++) tried.add(i);
+          continue;
+        }
+        const c = this.tee.connection;
+        if (!c) break;
+        this.announceJoin = true;
+        try {
+          await this.sendTx(c, [joinIx(this.pdas, tid, seat, this.me, this.playerLabel)], false);
+        } catch (e) {
+          this.joinErrors.push(`seat ${seat}: ${(e as Error).message}`.slice(0, 240));
+          if (this.joinErrors.length > 8) this.joinErrors.shift();
+          // a phase refusal is retried on the same seat; anything else moves to another seat
+          await this.refreshTable(tid);
+          if (this.table!.phase !== PHASE.bell && this.table!.phase !== PHASE.aborted) tried.add(seat);
+          await sleep(300);
+          continue;
+        }
+        for (let i = 0; i < 25 && !this.stopped && this.seat === null; i++) {
+          await sleep(200);
+          await this.refreshTable(tid);
+        }
+        tried.add(seat);
       }
-      this.flash("could not take a seat · try again");
+      if (this.seat === null) this.flash("could not take a seat · try again");
     } finally {
       this.joining = false;
       this.refreshBanner();
     }
+  }
+
+  private async refreshTable(tid: bigint) {
+    const d = await this.tee.get(this.pdas.table(tid)).catch(() => null);
+    if (d) this.onTable(d);
   }
 
   /** Sign with the burner and send; resolves with the signature once confirmed (or throws). */
@@ -677,7 +761,12 @@ class ChainDriver implements GameDriver {
     const pool = tp ? tp.pool.map((x) => Number(x)) : new Array(DESKS).fill(0);
     let paid: TapeView["paid"];
     if (tp?.resolved) paid = tp.void || !tp.pool[tp.winner] ? "refund" : Number(tp.total) / Number(tp.pool[tp.winner]);
-    return { pool, closeBeat: TAPE_CLOSE_BEAT, myCall: this.call ? this.call.desk : null, paid, needsFunding: this.needsFunding };
+    else if (tp && this.revealTop !== null && tp.total > 0n) {
+      // calls are closed by the bell, so the pool is final: the settle will pay this multiple
+      const onTop = tp.pool[this.revealTop];
+      paid = onTop > 0n ? Number(tp.total) / Number(onTop) : "refund";
+    }
+    return { pool, closeBeat: TAPE_CLOSE_BEAT, myCall: this.myCallDesk, paid, needsFunding: this.needsFunding };
   }
 
   private onTape(d: Uint8Array | null) {
@@ -691,6 +780,8 @@ class ChainDriver implements GameDriver {
 
   private onCall(d: Uint8Array | null) {
     this.call = d && isAccount(d, "Call") ? decodeCall(d) : null;
+    // a Call that disappears after the settle was paid out (anyone may send the claim)
+    if (this.call) this.myCallDesk = this.call.desk;
     this.w.set({ tape: this.tapeView() });
     if (this.tape?.resolved && this.call && !this.call.claimed) void this.claim().catch(() => {});
   }
@@ -708,7 +799,8 @@ class ChainDriver implements GameDriver {
 
   private async tapeCall(desk: number) {
     const t = this.table;
-    if (!t || this.tableId === null || this.round === null || desk < 0 || desk >= DESKS || this.call) return;
+    this.keepSeat = true;
+    if (!t || this.tableId === null || this.round === null || desk < 0 || desk >= DESKS || this.myCallDesk !== null) return;
     if (!t.recorded) return this.flash("no Tape on this round");
     if (t.phase >= PHASE.bell || (t.phase === PHASE.live && t.beat >= TAPE_CLOSE_BEAT)) return this.flash("the Tape is closed");
     if (!this.config) await this.loadConfig();
@@ -717,6 +809,10 @@ class ChainDriver implements GameDriver {
     if (!(await this.funded(callLamports + rent + BASE_FEE_RESERVE))) return;
     const round = this.round;
     await this.sendTx(this.base.connection, [placeCallIx(this.pdas, this.tableId, round, this.me, desk)], true);
+    if (this.round === round) {
+      this.myCallDesk = desk;
+      this.w.set({ tape: this.tapeView() });
+    }
     this.watches.call?.poke();
     this.watches.tape?.poke();
   }
@@ -769,6 +865,8 @@ class ChainDriver implements GameDriver {
         const built = buildReveal(record, commit, Number(n));
         if (!built) break;
         const startedAt = this.bellAt ?? now();
+        if (built.check.state === "ok") this.revealTop = built.view.topDesk;
+        this.w.set({ tape: this.tapeView() });
         this.w.set({ reveal: { ...built.view, check: { state: "pending" }, startedAt, explorerUrl: this.explorer(tid, n, t.recorded === 1) }, joinNotice: null });
         const wait = Math.max(0, startedAt + 6000 - now());
         setTimeout(() => {
@@ -825,6 +923,13 @@ class ChainDriver implements GameDriver {
       ackP50: pct(this.acks, 50),
       ackP95: pct(this.acks, 95),
       ackN: this.acks.length,
+      resultLagP50: pct(this.lags, 50),
+      resultLagP95: pct(this.lags, 95),
+      resultLagN: this.lags.length,
+      deskActs: this.desk?.acts ?? null,
+      deskLastSeq: this.desk?.lastSeq ?? null,
+      lastSentSeq: this.lastSentSeq,
+      joinErrors: [...this.joinErrors],
       slotMs: this.clock.slotMs,
       needsFunding: this.needsFunding,
       watches: ws,

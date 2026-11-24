@@ -73,14 +73,19 @@ export class AuthError extends Error {
   }
 }
 
+/** The rollup's login text: "Login to Query Filtering Service\nTimestamp: <unix>\nUser: <base58 key>". */
+export const isLoginChallenge = (c: string, address: string) =>
+  c.length <= 160 && /^Login to Query Filtering Service\nTimestamp: \d{1,13}\nUser: [1-9A-HJ-NP-Za-km-z]{32,44}$/.test(c) && c.endsWith(`\nUser: ${address}`);
+
 /** challenge -> ed25519 signature -> token (the rollup's query-filtering login). */
 export async function login(endpoint: string, b: Burner, fetchImpl: typeof fetch = fetch): Promise<Token> {
   const ch = await fetchImpl(`${endpoint}/auth/challenge?pubkey=${b.address}`);
   const cj = (await ch.json().catch(() => ({}))) as { challenge?: string; error?: string };
   if (!ch.ok || typeof cj.challenge !== "string" || !cj.challenge) throw new AuthError(`challenge failed: ${cj.error ?? ch.status}`, ch.status);
-  // Sign only short printable text. A serialized transaction message starts with a
-  // non-printable byte, so the endpoint can never obtain a transaction signature this way.
-  if (!/^[\x20-\x7e]{1,512}$/.test(cj.challenge)) throw new AuthError("challenge rejected: not printable text", 0);
+  // Sign only the login text in its exact known shape, naming this key. A serialized
+  // transaction message starts with a non-printable byte, so the endpoint can never
+  // obtain a transaction signature this way.
+  if (!isLoginChallenge(cj.challenge, b.address)) throw new AuthError("challenge rejected: unexpected format", 0);
   const sig = nacl.sign.detached(new TextEncoder().encode(cj.challenge), b.secretKey);
   const lr = await fetchImpl(`${endpoint}/auth/login`, {
     method: "POST",

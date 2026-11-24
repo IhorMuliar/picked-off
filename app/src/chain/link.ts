@@ -19,6 +19,21 @@ export interface AccountSource {
 
 export type LinkState = "connecting" | "ok" | "offline";
 
+/**
+ * Drop the raw websocket the way a network failure would (the client reconnects and
+ * re-subscribes by itself). Test hook for the reconnect path.
+ */
+export function dropSocket(c: Connection | null) {
+  const rpc = (c as unknown as { _rpcWebSocket?: { socket?: { socket?: { close?: () => void }; close?: () => void } } } | null)?._rpcWebSocket;
+  const raw = rpc?.socket?.socket ?? rpc?.socket;
+  try {
+    raw?.close?.();
+  } catch {
+    /* already closed */
+  }
+}
+
+/** Close a connection's websocket for good (only when the whole driver stops). */
 export function closeSocket(c: Connection | null) {
   // web3.js 1.x keeps its websocket client private; close it so a replaced connection stops reconnecting
   const ws = (c as unknown as { _rpcWebSocket?: { close?: () => void } } | null)?._rpcWebSocket;
@@ -99,7 +114,6 @@ export class TeeLink extends ConnSource {
   }
 
   private install(token: string, expiresAt: number) {
-    const old = this.c;
     this.token = token;
     const fetchWith401: typeof fetch = async (input, init) => {
       const r = await fetch(input, init);
@@ -112,7 +126,9 @@ export class TeeLink extends ConnSource {
       disableRetryOnRateLimit: true,
       fetch: fetchWith401,
     });
-    closeSocket(old);
+    // The old connection is not closed here: closing it while its subscriptions are still
+    // being removed makes the client retry the unsubscribe forever. Watchers unsubscribe from
+    // it on `replaced()` and the client closes an idle socket by itself.
     if (this.refreshTimer) clearTimeout(this.refreshTimer);
     const ms = Math.min(2 ** 31 - 1, Math.max(5_000, expiresAt - Date.now() - 60_000));
     this.refreshTimer = setTimeout(() => void this.reauth(token), ms);
@@ -127,7 +143,10 @@ export class TeeLink extends ConnSource {
       this.setState("connecting", "rollup token rejected, signing in again");
       this.reauthing = this.tokens
         .refresh()
-        .then((t) => this.install(t.token, t.expiresAt))
+        .then((t) => {
+          this.install(t.token, t.expiresAt);
+          this.setState("ok");
+        })
         .catch((e) => this.setState("offline", (e as Error).message))
         .finally(() => {
           this.reauthing = null;

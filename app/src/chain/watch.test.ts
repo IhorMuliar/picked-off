@@ -4,7 +4,7 @@ import bs58 from "bs58";
 import { Keypair } from "@solana/web3.js";
 import { watchAccount } from "./watch";
 import type { AccountSource } from "./link";
-import { BURNER_KEY, loadOrCreateBurner, login, TokenStore, type KV } from "./burner";
+import { BURNER_KEY, isLoginChallenge, loadOrCreateBurner, login, TokenStore, type KV } from "./burner";
 import { SlotClock } from "./slotclock";
 import { makeConfig, parseTableIds, withToken } from "./config";
 
@@ -139,7 +139,7 @@ describe("burner and rollup login", () => {
     const log: string[] = [];
     const f = (async (url: string, init?: RequestInit) => {
       log.push(url);
-      if (url.includes("/auth/challenge")) return Response.json({ challenge: "Login to Query Filtering Service / Timestamp 1 / User x" });
+      if (url.includes("/auth/challenge")) return Response.json({ challenge: `Login to Query Filtering Service\nTimestamp: 1795522470\nUser: ${new URL(url).searchParams.get("pubkey")}` });
       const body = JSON.parse(String(init!.body));
       const ok = nacl.sign.detached.verify(new TextEncoder().encode(body.challenge), bs58.decode(body.signature), bs58.decode(body.pubkey));
       if (!ok) return Response.json({ error: "bad signature" }, { status: 401 });
@@ -172,6 +172,17 @@ describe("burner and rollup login", () => {
     const s3 = new TokenStore("http://tee", b, kv, tee.f);
     const [x, y] = await Promise.all([s3.refresh(), s3.refresh()]);
     expect(x.token).toBe(y.token);
+  });
+
+  it("signs only the exact login text naming this key", async () => {
+    const b = loadOrCreateBurner(memKV());
+    const ok = `Login to Query Filtering Service\nTimestamp: 1795522470\nUser: ${b.address}`;
+    expect(isLoginChallenge(ok, b.address)).toBe(true);
+    expect(isLoginChallenge(ok.replace(b.address, Keypair.generate().publicKey.toBase58()), b.address)).toBe(false);
+    expect(isLoginChallenge("\x01\x00\x01" + ok, b.address)).toBe(false);
+    expect(isLoginChallenge(ok + "\nextra", b.address)).toBe(false);
+    const f = (async () => Response.json({ challenge: "AQABAw==" })) as unknown as typeof fetch;
+    await expect(login("http://tee", b, f)).rejects.toThrow(/unexpected format/);
   });
 
   it("refreshes a token about to expire", async () => {
