@@ -20,9 +20,11 @@ systemctl is-active --quiet "$UNIT" || { rm -f "$STATE/fails"; exit 0; }
 enter=$(systemctl show -p ActiveEnterTimestampMonotonic --value "$UNIT")
 now=$(awk '{printf "%d", $1 * 1000000}' /proc/uptime)
 up=$(( (now - ${enter:-0}) / 1000000 ))
-[ "$up" -lt "$GRACE" ] && exit 0
-
 body=$(curl -s -m 10 "$URL")
+if [ -n "$body" ] && [ "$(echo "$body" | jq -r '.recording' 2>/dev/null)" = "false" ]; then
+  say "LOW HOUSE BALANCE: $(echo "$body" | jq -r '.balanceSol') SOL < $(echo "$body" | jq -r '.minBalanceSol') SOL, records stopped"
+fi
+[ "$up" -lt "$GRACE" ] && exit 0
 if [ -z "$body" ] || ! echo "$body" | jq -e . >/dev/null 2>&1; then
   n=$(( $(cat "$STATE/fails" 2>/dev/null || echo 0) + 1 ))
   echo "$n" > "$STATE/fails"
@@ -38,9 +40,6 @@ rm -f "$STATE/fails"
 
 # a pool with no finished round for > MAX_AGE (null = none since the start, which is > GRACE ago)
 stale=$(echo "$body" | jq -r --argjson max "$MAX_AGE" '[.pools[] | select(.lastRoundAgeSec == null or .lastRoundAgeSec > $max) | "\(.pool):\(.lastRoundAgeSec)"] | join(",")')
-if [ "$(echo "$body" | jq -r '.recording')" = "false" ]; then
-  say "LOW HOUSE BALANCE: $(echo "$body" | jq -r '.balanceSol') SOL < $(echo "$body" | jq -r '.minBalanceSol') SOL, records stopped"
-fi
 if [ -n "$stale" ]; then
   say "RESTART $UNIT: no round progress for > ${MAX_AGE}s in pool(s) $stale (uptime ${up}s)"
   systemctl restart "$UNIT"

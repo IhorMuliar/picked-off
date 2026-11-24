@@ -3,16 +3,19 @@
 //   [record: create_record + delegate on base, pipelined during the previous round] → re-seal →
 //   open_round → crank ticks to the bell (liveness: reschedule a stalled crank, abort a stuck round) →
 //   reveal → unseal → LIGHTS ON → next round; recorded rounds go on to commit → settle → claims → close.
-import { Chain, BN, PublicKey, KIND, PHASE, SEAT, SEAL_ALL, NDESK, ROUND_STATUS, decodeTable, decodeConfig, decodeRound, decodeDesk, errText, must, sleep, type TableView } from "./chain.ts";
-import { Bot, PERSONALITIES, SEAT_MIX, seatName, type PoolView, type Snapshot } from "./bots.ts";
+import bs58 from "bs58";
+import { Chain, BN, PublicKey, rpc, ACT_DISC, KIND, PHASE, SEAT, SEAL_ALL, NDESK, ROUND_STATUS, decodeTable, decodeConfig, decodeRound, decodeDesk, errText, must, sleep, type TableView } from "./chain.ts";
+import { Bot, PERSONALITIES, SEAT_MIX, SEND_TIMEOUT_MS, seatName, type PoolView, type Snapshot, type SendTrack } from "./bots.ts";
 import { Records } from "./records.ts";
 import { log } from "./log.ts";
 
-export interface PoolHealth { pool: number; round: number; phase: number; lastRoundAt: number; lastRoundAgeSec: number | null; stuck: boolean; rounds: number; aborts: number; reschedules: number; records: { outstanding: number[]; committed: number; closed: number; stranded: number; failedCommits: number }; bots: number }
+export interface PoolHealth { pool: number; round: number; phase: number; lastRoundAt: number; lastRoundAgeSec: number | null; stuck: boolean; rounds: number; aborts: number; reschedules: number; records: { outstanding: number[]; committed: number; closed: number; stranded: number; failedCommits: number }; bots: number; lateActs: Record<string, number>; sendsInflight: number; sendsAborted: number }
 
 // earliest next open = HIDE 5 s + the earliest bell after 20 beats of 1.5 s + LIGHTS ON; a pipelined record's
 // planned start is set to it, so its Tape calls close during the next round's live play
 const MIN_ROUND_SECS = 35;
+// a round's unseal waits for every bot send to settle; past this time after the bell it unseals anyway (and says so)
+const UNSEAL_HARD_BOUND_MS = 6 * SEND_TIMEOUT_MS;
 
 export class Pool implements PoolView {
   snap: Snapshot | null = null;
@@ -65,7 +68,7 @@ export class Pool implements PoolView {
     return { pool: this.tableId, round: t?.round ?? -1, phase: t?.phase ?? -1, lastRoundAt: this.lastRoundAt, lastRoundAgeSec: age, stuck: stuckFor > this.cfg.stallMs || (age !== null && age > 180),
       rounds: this.rounds, aborts: this.aborts, reschedules: this.reschedules,
       records: { outstanding: this.records.outstanding, committed: this.records.committed, closed: this.records.closed, stranded: this.records.stranded, failedCommits: this.records.failedCommits },
-      bots: this.bots.filter((b) => b?.running).length };
+      bots: this.bots.filter((b) => b?.running).length, lateActs: this.lateTotals, sendsInflight: this.sends.inflight, sendsAborted: this.sends.aborted };
   }
 
   stop() {
@@ -275,7 +278,8 @@ export class Pool implements PoolView {
     }
   }
 
-  // ---------------------------------------------------------------- bell → reveal → unseal
+  // ---------------------------------------------------------------- bell → reveal → commit → (quiet) → unseal
+  private revealInfo = new Map<number, { revealMs: number; commitMs?: number; revealedAt: number }>();
   private async reveal(t: TableView) {
     const c = this.chain;
     this.sendClosed = true;
@@ -292,40 +296,84 @@ export class Pool implements PoolView {
       await this.records.commit(t.round, this.bellSeenAt.get(t.round)).catch((e) => log.warn("commit_error", { pool: this.tableId, round: t.round, err: String(e?.message ?? e) }));
       commitMs = Math.round(performance.now() - t2);
     }
-    const unsealMs = await this.unseal(t.round);
-    this.finishRound(t, revealMs, unsealMs, commitMs);
+    this.revealInfo.set(t.round, { revealMs, commitMs, revealedAt: Date.now() });
+    // the unseal follows from afterReveal once every bot send has settled (fail closed)
     await this.fresh((x) => x.phase !== PHASE.bell || x.round !== t.round);
   }
 
-  /** Before anything becomes public: no bot send may still be on its way (each act must land while the round is private). */
-  private async botsQuiet(n?: number): Promise<{ quietMs: number | null; waitedMs: number }> {
+  /** Bot act sends of this pool (all bots, also ones stopped or replaced during the round). */
+  readonly sends: SendTrack = { inflight: 0, lastSettledAt: 0, aborted: 0 };
+  /** Fail closed: the round may become public only when no bot send is in flight and none settled (answered, failed or
+   *  aborted) within `unsealQuietMs`, and the bell is at least that long ago. Past the hard bound it unseals anyway,
+   *  loudly, so a round can never wedge. */
+  private unsealGate(n: number): { ok: boolean; forced: boolean; quietMs: number | null; inflight: number } {
     this.sendClosed = true;
-    const t0 = Date.now();
-    const live = () => this.bots.filter((b): b is Bot => !!b);
-    while (live().some((b) => b.inflight > 0) && Date.now() - t0 < 3_000) await sleep(25);
-    const last = Math.max(0, ...live().map((b) => b.lastSendAt));
-    const bell = n !== undefined ? this.bellSeenAt.get(n) ?? 0 : 0;
-    // margin for a tx accepted but not yet executed, and for the rollup's stream delivering it late
-    const until = Math.max(last, bell) + this.cfg.unsealQuietMs;
-    if (until > Date.now()) await sleep(until - Date.now());
-    return { quietMs: last ? Date.now() - last : null, waitedMs: Date.now() - t0 };
+    const now = Date.now();
+    const bell = this.bellSeenAt.get(n) ?? 0;
+    const last = Math.max(this.sends.lastSettledAt, bell);
+    const quiet = this.sends.inflight === 0 && now - last >= this.cfg.unsealQuietMs;
+    const forced = !quiet && bell > 0 && now - bell > UNSEAL_HARD_BOUND_MS;
+    return { ok: quiet || forced, forced, quietMs: this.sends.lastSettledAt ? now - this.sends.lastSettledAt : null, inflight: this.sends.inflight };
   }
 
-  private lastQuiet: { quietMs: number | null; waitedMs: number; inflight: number } | null = null;
-  private async unseal(n: number): Promise<number> {
-    const q = await this.botsQuiet(n);
-    this.lastQuiet = { ...q, inflight: this.bots.reduce((a, b) => a + (b?.inflight ?? 0), 0) };
+  private lastQuiet: { quietMs: number | null; inflight: number; forced: boolean; aborted: number } | null = null;
+  /** Unseals round n if the gate allows; returns the unseal time in ms, or null when it has to wait (retried next tick). */
+  private async tryUnseal(n: number): Promise<number | null> {
+    const g = this.unsealGate(n);
+    if (!g.ok) return null;
+    if (g.forced) log.error("unseal_forced", { pool: this.tableId, round: n, inflight: g.inflight, quietMs: g.quietMs, boundMs: UNSEAL_HARD_BOUND_MS, note: "bot sends still unsettled at the hard bound: unsealing anyway" });
+    this.lastQuiet = { quietMs: g.quietMs, inflight: g.inflight, forced: g.forced, aborted: this.sends.aborted };
     const c = this.chain, t0 = performance.now();
     const items: [number, number, PublicKey][] = [[KIND.book, 0, this.book], ...this.desks.map((d, s) => [KIND.desk, s, d] as [number, number, PublicKey])];
+    let firstSig = "";
     for (let i = 0; i < items.length; i += 3) {
       const ixs = [];
       for (const [kind, idx, acc] of items.slice(i, i + 3)) ixs.push(await c.progEr.methods.unseal(kind, new BN(idx)).accountsPartial({ house: c.house.publicKey, table: this.table, target: acc, permission: c.pda.perm(acc) }).instruction());
-      must(await c.sendEr(ixs, { cu: 1_000_000 }), `unseal ${i}`);
+      const r = must(await c.sendEr(ixs, { cu: 1_000_000 }), `unseal ${i}`);
+      if (!firstSig) firstSig = r.sig;
     }
     this.unsealed.add(n);
     const ms = Math.round(performance.now() - t0);
     await this.idleHumans(n).catch((e) => log.warn("idle_check_error", { pool: this.tableId, round: n, err: String(e?.message ?? e) }));
+    const bellSlot = this.snap?.table.round === n ? this.snap.table.bellSlot : 0;
+    setTimeout(() => this.lateActs(n, bellSlot, firstSig).catch((e) => log.warn("late_acts_error", { pool: this.tableId, round: n, err: String(e?.message ?? e) })), 1_000);
     return ms;
+  }
+
+  /** Audit while the round is public (before the re-seal): transactions on the Book after the bell / after the unseal
+   *  that are not the house's, i.e. acts that landed late, split into this pool's bots and other signers. */
+  lateTotals = { rounds: 0, afterBellBot: 0, afterBellOther: 0, afterUnsealBot: 0, afterUnsealOther: 0 };
+  private async lateActs(n: number, bellSlot: number, unsealSig: string) {
+    const c = this.chain;
+    await c.ensureHouseToken();
+    const url = c.erUrl(c.houseToken);
+    const st = (await rpc(url, "getSignatureStatuses", [[unsealSig]])).body?.result?.value?.[0];
+    const unsealSlot: number = st?.slot ?? 0;
+    const list: any[] = (await rpc(url, "getSignaturesForAddress", [this.book.toBase58(), { limit: 200 }])).body?.result ?? [];
+    if (!unsealSlot || !bellSlot || !list.length) return;
+    const house = c.house.publicKey.toBase58();
+    const bots = new Set(this.botKeys);
+    const out = { afterBellBot: 0, afterBellOther: 0, afterUnsealBot: 0, afterUnsealOther: 0 };
+    const samples: any[] = [];
+    for (const x of list) {
+      if (x.slot < bellSlot) continue;
+      const tx = (await rpc(url, "getTransaction", [x.signature, { encoding: "json", maxSupportedTransactionVersion: 0 }])).body?.result;
+      const msg = tx?.transaction?.message;
+      const signer: string | undefined = msg?.accountKeys?.[0];
+      if (!signer || signer === house) continue;
+      const prog = c.programId.toBase58();
+      const isAct = (msg.instructions ?? []).some((ix: any) => msg.accountKeys[ix.programIdIndex] === prog && Buffer.from(bs58.decode(ix.data)).subarray(0, 8).equals(ACT_DISC));
+      if (!isAct) continue;
+      const bot = bots.has(signer);
+      const after = x.slot >= unsealSlot;
+      if (bot) out.afterBellBot++; else out.afterBellOther++;
+      if (after) { if (bot) out.afterUnsealBot++; else out.afterUnsealOther++; }
+      if (samples.length < 5) samples.push({ sig: x.signature.slice(0, 8), slot: x.slot, bot, afterUnseal: after });
+    }
+    this.lateTotals.rounds++;
+    for (const k of Object.keys(out) as (keyof typeof out)[]) this.lateTotals[k] += out[k];
+    const any = out.afterBellBot + out.afterBellOther > 0;
+    (any ? log.warn : log.info)("late_acts", { pool: this.tableId, round: n, bellSlot, unsealSlot, ...out, samples: any ? samples : undefined });
   }
 
   /** After the reveal (every Desk public): a player seated for the whole round whose Desk accepted no act in it gets its seat back to a bot. */
@@ -357,7 +405,7 @@ export class Pool implements PoolView {
     log.info("round", { pool: this.tableId, round: t.round, recorded: t.recorded, beats: t.beat, bellSlot: t.bellSlot, openSlot: t.openSlot,
       liveSlots: t.bellSlot && t.openSlot ? t.bellSlot - t.openSlot : null, fallbackSeed: t.fallbackSeed, tickCalls: t.tickCalls, resolves: t.resolves,
       roundMs, openMs: oi?.openMs, resealMs: oi?.resealMs, gapMs: oi?.gapMs, revealMs, commitMs, unsealMs,
-      botsQuietMs: this.lastQuiet?.quietMs, botsInflightAtUnseal: this.lastQuiet?.inflight, recordSig: oi?.recordSig, picked: t.picked,
+      botsQuietMs: this.lastQuiet?.quietMs, botsInflightAtUnseal: this.lastQuiet?.inflight, unsealForced: this.lastQuiet?.forced || undefined, sendsAborted: this.lastQuiet?.aborted, recordSig: oi?.recordSig, picked: t.picked,
       reschedules: this.progress.round === t.round ? this.progress.reschedules : 0, n: this.rounds });
     this.openInfo.delete(t.round);
     this.bellSeenAt.delete(t.round);
@@ -366,10 +414,17 @@ export class Pool implements PoolView {
   private async afterReveal(s: Snapshot) {
     const t = s.table;
     if (!this.unsealed.has(t.round)) {
-      // resumed after a reveal: make the round public (idempotent), then carry on
-      const unsealMs = await this.unseal(t.round);
-      log.info("resume_unsealed", { pool: this.tableId, round: t.round, unsealMs });
-      if (!this.lastBellAt) this.lastBellAt = Date.now() - Math.max(0, this.nowSlotAge(s, t.bellSlot));
+      const ri = this.revealInfo.get(t.round);
+      if (!this.bellSeenAt.has(t.round)) this.bellSeenAt.set(t.round, Date.now() - Math.max(0, this.nowSlotAge(s, t.bellSlot)));
+      const unsealMs = await this.tryUnseal(t.round); // idempotent on a resumed, already public round
+      if (unsealMs === null) { await sleep(100); return; } // a bot send still unsettled: try again on the next tick
+      if (ri) { this.revealInfo.delete(t.round); this.finishRound(t, ri.revealMs, unsealMs, ri.commitMs); }
+      else {
+        // resumed after a reveal
+        log.info("resume_unsealed", { pool: this.tableId, round: t.round, unsealMs });
+        if (!this.lastBellAt) this.lastBellAt = this.bellSeenAt.get(t.round) ?? Date.now();
+        this.bellSeenAt.delete(t.round);
+      }
     }
     // LIGHTS ON: the revealed round stays public for the replay before the next round opens
     const wait = (this.lastBellAt || Date.now()) + this.cfg.lightsOnMs - Date.now();
@@ -390,7 +445,7 @@ export class Pool implements PoolView {
   }
 
   // ---------------------------------------------------------------- next round: seats, record, re-seal, open, pipeline
-  /** Record cadence: every round with a player seated, otherwise one round per `recordEverySec` (`aheadMs`: judged at that time from now). */
+  /** Record cadence: every round with a player seated, otherwise one round per `recordEverySec` (`aheadMs`: evaluated that far ahead). */
   private shouldRecord(t: TableView, aheadMs = 0) {
     if (!this.chain.canRecord()) return false;
     const human = t.seats.some((x) => x.kind === SEAT.human);

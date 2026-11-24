@@ -95,7 +95,11 @@ export class Brain {
 
 // ------------------------------------------------------------------ the shared view a pool gives its bots (public Table only)
 export interface Snapshot { table: TableView; slot: number; at: number; slotMs: number }
-export interface PoolView { tableId: number; snap: Snapshot | null; book: PublicKey; blockhash(): string | null; /** true from the moment the house sees the bell until the next open */ sendClosed: boolean }
+/** Act sends of every bot of a pool, kept by the pool (so a bot stopped or replaced mid-round still counts). */
+export interface SendTrack { inflight: number; lastSettledAt: number; aborted: number }
+export interface PoolView { tableId: number; snap: Snapshot | null; book: PublicKey; blockhash(): string | null; /** true from the moment the house sees the bell until the next open */ sendClosed: boolean; sends: SendTrack }
+/** an act send not answered within this time is aborted (shorter than the pool's quiet window before an unseal) */
+export const SEND_TIMEOUT_MS = 2_000;
 /** a bot sends only on a Table view at most this old (a stalled poll must never let it send into a revealed round) */
 const MAX_SNAP_AGE_MS = 700;
 
@@ -297,9 +301,6 @@ export class Bot {
     return Buffer.concat([Buffer.from([1]), sig, m]).toString("base64");
   }
 
-  /** sends not answered yet, and the time of the last send */
-  inflight = 0;
-  lastSendAt = 0;
   private sendAct(c: Choice) {
     const bh = this.pool.blockhash();
     if (!bh || !this.stats || this.pool.sendClosed) return;
@@ -310,15 +311,17 @@ export class Bot {
     if (!st.firstSend) st.firstSend = now;
     st.lastSend = now;
     st.sent++;
-    this.lastSendAt = now;
-    this.inflight++;
-    fetch(this.sendUrl, { method: "POST", headers: { "content-type": "application/json" },
+    const track = this.pool.sends;
+    track.inflight++;
+    const ac = new AbortController();
+    const timer = setTimeout(() => { ac.abort(); track.aborted++; }, SEND_TIMEOUT_MS);
+    fetch(this.sendUrl, { method: "POST", headers: { "content-type": "application/json" }, signal: ac.signal,
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "sendTransaction", params: [raw, { encoding: "base64", skipPreflight: true, maxRetries: 0 }] }) })
       .then(async (r) => {
         const j: any = await r.json().catch(() => null);
         if (!r.ok || j?.error) { st.sendErr++; if (r.status === 401) this.token = ""; }
       })
       .catch(() => { st.sendErr++; })
-      .finally(() => { this.inflight--; });
+      .finally(() => { clearTimeout(timer); track.inflight--; track.lastSettledAt = Date.now(); });
   }
 }

@@ -6,7 +6,9 @@
 //  5. log rotation by size;
 //  6. soft balance rule: below SOFT_BALANCE_SOL a seated player makes a round recorded at most every
 //     LOW_RECORD_EVERY_SEC; above it every such round is recorded;
-//  7. bots never send once the house has seen the bell, or on a stale Table view.
+//  7. bots never send once the house has seen the bell, or on a stale Table view;
+//  8. the unseal gate fails closed: no unseal while a bot send is in flight or settled within the quiet
+//     window; past the hard bound it unseals (forced) so a round cannot wedge.
 //   npx tsx house/test/guards.ts
 import fs from "node:fs";
 import os from "node:os";
@@ -98,6 +100,20 @@ async function main() {
   bot.stats.final = {}; // no final read in this offline check
   await bot.slot(); const bell = sent - live - stale - closed;
   check("bot sends in LIVE only on a fresh view and before the house sees the bell", live === 1 && stale === 0 && closed === 0 && bell === 0, { live, stale, closed, bell });
+
+  // 8. unseal gate
+  const now = Date.now();
+  pool.bellSeenAt.set(7, now - 5_000);
+  pool.sends.inflight = 1; pool.sends.lastSettledAt = now - 10_000;
+  const g1 = pool.unsealGate(7);
+  pool.sends.inflight = 0; pool.sends.lastSettledAt = now - 500;
+  const g2 = pool.unsealGate(7);
+  pool.sends.lastSettledAt = now - 3_000;
+  const g3 = pool.unsealGate(7);
+  pool.sends.inflight = 2; pool.bellSeenAt.set(7, now - 13_000);
+  const g4 = pool.unsealGate(7);
+  check("unseal gate: in flight → wait; settled 0.5 s ago → wait; quiet 3 s → unseal; still in flight 13 s after the bell → forced",
+    !g1.ok && !g2.ok && g3.ok && !g3.forced && g4.ok && g4.forced, { g1, g2, g3, g4 });
 
   fs.rmSync(dir, { recursive: true, force: true });
   process.exit(summary());

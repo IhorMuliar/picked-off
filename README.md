@@ -159,6 +159,6 @@ Left open, by design or for lack of time:
 - **No sybil resistance in free pools.** Anyone can take free seats, and several burners can sit at one pool; each takeover hands over that desk's results so far, like colluding players. In the model, two desks sharing everything gain about 0.03 stakes each.
 - **Bots were tuned in the model, not on humans.** All skill numbers above are simulated.
 - **Latency is from one region** (EU). The game shows each visitor their own measured number.
-- **Logs**: once, an outsider's program-filtered log stream delivered 9 act-shaped transactions about 2 s after they landed while a pool was live: constant CU, no logs, so at most act timing, which the constant cadence already makes public. Not seen again in 6 more minutes or 9 probed rounds.
+- **Log streams replay a round once it is public.** A few acts sent in the last half second before a bell land just after it, still private, and a log subscriber receives them when that round is revealed about a second later (seen as 9 deliveries next to another pool's live round). They carry constant CU and no logs, and the round they belong to is over.
 
 MIT licence.
