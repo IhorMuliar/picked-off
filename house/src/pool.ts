@@ -16,6 +16,8 @@ const MIN_ROUND_SECS = 35;
 
 export class Pool implements PoolView {
   snap: Snapshot | null = null;
+  /** bots stop sending from the moment the house sees the bell (set before the reveal) until the next open */
+  sendClosed = false;
   readonly table: PublicKey;
   readonly book: PublicKey;
   readonly desks: PublicKey[];
@@ -24,7 +26,8 @@ export class Pool implements PoolView {
   private bh: { hash: string; at: number } | null = null;
   readonly records: Records;
   private stopped = false;
-  private slotMs = 50;
+  private slotMs: number; // rollup slot duration, measured (prior: the cluster's nominal rate)
+  private slotMsMeasured = false;
   private slotRef: { slot: number; at: number } | null = null;
   // liveness of the current round
   private progress = { round: -1, resolves: -1, at: 0, rescheduledDeadline: -1, reschedules: 0 };
@@ -44,6 +47,7 @@ export class Pool implements PoolView {
   private roundDurations: number[] = [];
 
   constructor(private chain: Chain, readonly tableId: number) {
+    this.slotMs = chain.cfg.cluster === "local" ? 50 : 10;
     this.table = chain.pda.table(tableId);
     this.book = chain.pda.book(tableId);
     this.desks = Array.from({ length: NDESK }, (_, s) => chain.pda.desk(tableId, s));
@@ -83,7 +87,8 @@ export class Pool implements PoolView {
           if (!this.slotRef) this.slotRef = { slot, at: now };
           else if (now - this.slotRef.at > 5_000 && slot > this.slotRef.slot) {
             const ms = (now - this.slotRef.at) / (slot - this.slotRef.slot);
-            this.slotMs = this.slotMs * 0.7 + ms * 0.3;
+            this.slotMs = this.slotMsMeasured ? this.slotMs * 0.7 + ms * 0.3 : ms;
+            this.slotMsMeasured = true;
             this.slotRef = { slot, at: now };
           }
           this.snap = { table: decodeTable(a.data), slot, at: now, slotMs: this.slotMs };
@@ -118,11 +123,11 @@ export class Pool implements PoolView {
     for (let s = 0; s < NDESK; s++) {
       const seat = t.seats[s];
       const b = this.bots[s];
-      if (seat.kind === SEAT.bot && seat.key === this.botKeys[s] && !b?.running) {
+      if (seat.kind === SEAT.bot && seat.key === this.botKeys[s] && !b?.alive) {
         const nb = new Bot(this.chain, this, s, PERSONALITIES[SEAT_MIX[s]], this.cfg.botKeysDir);
         this.bots[s] = nb;
         nb.onRoundDone = (st) => this.botRound.push({ seat: s, name: nb.name, kind: SEAT_MIX[s], ...st });
-        nb.start().catch((e) => log.warn("bot_start_error", { pool: this.tableId, seat: s, err: String(e?.message ?? e) }));
+        nb.start().catch((e) => { log.warn("bot_start_error", { pool: this.tableId, seat: s, err: String(e?.message ?? e) }); nb.stop("start failed"); });
         log.info("bot_started", { pool: this.tableId, seat: s, name: nb.name, key: nb.key.publicKey.toBase58() });
       }
     }
@@ -241,6 +246,7 @@ export class Pool implements PoolView {
   // ---------------------------------------------------------------- liveness: reschedule a stalled crank, abort a stuck round
   private async liveness(s: Snapshot) {
     const t = s.table, c = this.chain;
+    if (!this.slotMsMeasured) return; // slot ages are only trusted once the slot rate is measured (≈ 5 s after a start)
     if (this.progress.round !== t.round || this.progress.resolves !== t.resolves) {
       this.progress = { ...this.progress, round: t.round, resolves: t.resolves, at: Date.now(), ...(this.progress.round !== t.round ? { rescheduledDeadline: -1, reschedules: 0 } : {}) };
       return;
@@ -272,18 +278,43 @@ export class Pool implements PoolView {
   // ---------------------------------------------------------------- bell → reveal → unseal
   private async reveal(t: TableView) {
     const c = this.chain;
+    this.sendClosed = true;
     if (!this.bellSeenAt.has(t.round)) this.bellSeenAt.set(t.round, Date.now() - Math.max(0, this.nowSlotAge(this.snap!, t.bellSlot || this.snap!.slot)));
     const ix = await c.progEr.methods.reveal().accountsPartial({ caller: c.house.publicKey, table: this.table, book: this.book, round: t.recorded ? c.pda.round(this.tableId, t.round) : null }).instruction();
     const t0 = performance.now();
     const r = await c.sendEr([ix], { cu: 400_000 });
     if (!r.ok) { log.warn("reveal_failed", { pool: this.tableId, round: t.round, err: errText(r) }); await sleep(500); return; }
     const revealMs = Math.round(performance.now() - t0);
+    // a recorded round is committed at once, before the unseal (bell → Round on base is then ≈ 3 s, not 6-14 s)
+    let commitMs: number | undefined;
+    if (t.recorded) {
+      const t2 = performance.now();
+      await this.records.commit(t.round, this.bellSeenAt.get(t.round)).catch((e) => log.warn("commit_error", { pool: this.tableId, round: t.round, err: String(e?.message ?? e) }));
+      commitMs = Math.round(performance.now() - t2);
+    }
     const unsealMs = await this.unseal(t.round);
-    this.finishRound(t, revealMs, unsealMs);
+    this.finishRound(t, revealMs, unsealMs, commitMs);
     await this.fresh((x) => x.phase !== PHASE.bell || x.round !== t.round);
   }
 
+  /** Before anything becomes public: no bot send may still be on its way (each act must land while the round is private). */
+  private async botsQuiet(n?: number): Promise<{ quietMs: number | null; waitedMs: number }> {
+    this.sendClosed = true;
+    const t0 = Date.now();
+    const live = () => this.bots.filter((b): b is Bot => !!b);
+    while (live().some((b) => b.inflight > 0) && Date.now() - t0 < 3_000) await sleep(25);
+    const last = Math.max(0, ...live().map((b) => b.lastSendAt));
+    const bell = n !== undefined ? this.bellSeenAt.get(n) ?? 0 : 0;
+    // margin for a tx accepted but not yet executed, and for the rollup's stream delivering it late
+    const until = Math.max(last, bell) + this.cfg.unsealQuietMs;
+    if (until > Date.now()) await sleep(until - Date.now());
+    return { quietMs: last ? Date.now() - last : null, waitedMs: Date.now() - t0 };
+  }
+
+  private lastQuiet: { quietMs: number | null; waitedMs: number; inflight: number } | null = null;
   private async unseal(n: number): Promise<number> {
+    const q = await this.botsQuiet(n);
+    this.lastQuiet = { ...q, inflight: this.bots.reduce((a, b) => a + (b?.inflight ?? 0), 0) };
     const c = this.chain, t0 = performance.now();
     const items: [number, number, PublicKey][] = [[KIND.book, 0, this.book], ...this.desks.map((d, s) => [KIND.desk, s, d] as [number, number, PublicKey])];
     for (let i = 0; i < items.length; i += 3) {
@@ -315,7 +346,7 @@ export class Pool implements PoolView {
     if (out.size) this.reclaim.set(n, out);
   }
 
-  private finishRound(t: TableView, revealMs: number, unsealMs: number) {
+  private finishRound(t: TableView, revealMs: number, unsealMs: number, commitMs?: number) {
     const bellAt = this.bellSeenAt.get(t.round) ?? Date.now();
     this.lastBellAt = bellAt;
     const oi = this.openInfo.get(t.round);
@@ -325,7 +356,8 @@ export class Pool implements PoolView {
     this.lastRoundAt = Date.now();
     log.info("round", { pool: this.tableId, round: t.round, recorded: t.recorded, beats: t.beat, bellSlot: t.bellSlot, openSlot: t.openSlot,
       liveSlots: t.bellSlot && t.openSlot ? t.bellSlot - t.openSlot : null, fallbackSeed: t.fallbackSeed, tickCalls: t.tickCalls, resolves: t.resolves,
-      roundMs, openMs: oi?.openMs, resealMs: oi?.resealMs, gapMs: oi?.gapMs, revealMs, unsealMs, recordSig: oi?.recordSig, picked: t.picked,
+      roundMs, openMs: oi?.openMs, resealMs: oi?.resealMs, gapMs: oi?.gapMs, revealMs, commitMs, unsealMs,
+      botsQuietMs: this.lastQuiet?.quietMs, botsInflightAtUnseal: this.lastQuiet?.inflight, recordSig: oi?.recordSig, picked: t.picked,
       reschedules: this.progress.round === t.round ? this.progress.reschedules : 0, n: this.rounds });
     this.openInfo.delete(t.round);
     this.bellSeenAt.delete(t.round);
@@ -360,8 +392,12 @@ export class Pool implements PoolView {
   // ---------------------------------------------------------------- next round: seats, record, re-seal, open, pipeline
   /** Record cadence: every round with a player seated, otherwise one round per `recordEverySec` (`aheadMs`: judged at that time from now). */
   private shouldRecord(t: TableView, aheadMs = 0) {
+    if (!this.chain.canRecord()) return false;
     const human = t.seats.some((x) => x.kind === SEAT.human);
-    return human || Date.now() + aheadMs - this.records.lastRecordAt >= this.cfg.recordEverySec * 1000;
+    const since = Date.now() + aheadMs - this.records.lastRecordAt;
+    // below the soft balance threshold a seated player no longer makes every round recorded
+    if (human) return !this.chain.lowBalance() || since >= this.cfg.lowRecordEverySec * 1000;
+    return since >= this.cfg.recordEverySec * 1000;
   }
   /** Waits until the Table poll is newer than now (or `pred` holds). */
   private async fresh(pred: (t: TableView) => boolean = () => true, ms = 3_000) {
@@ -404,6 +440,7 @@ export class Pool implements PoolView {
     if (this.cfg.bots && (await this.refillSeats(t))) { await this.fresh(); return; } // re-read the Table before going on
     const roundPda = c.pda.round(this.tableId, n);
     // record: pipelined during the previous round, or created now (a player sat down, or the cadence is due)
+    await this.records.pendingCreate(n); // a record for n still being sent (pipelined): wait for it, never open past it
     let rb = await c.baseRead.account(roundPda);
     if (!rb.data && this.shouldRecord(t)) {
       if (!(await this.records.create(n, Math.floor(Date.now() / 1000) - 2))) return;
@@ -418,6 +455,9 @@ export class Pool implements PoolView {
       if (re.status !== ROUND_STATUS.created) { log.warn("record_not_fresh", { pool: this.tableId, round: n, status: re.status }); return; }
       const wait = re.plannedStartUnix * 1000 - Date.now() + 1_000;
       if (wait > 0) { await sleep(Math.min(wait, 1_000)); return; }
+      // open_round checks the planned start against the rollup's clock (within about a second of ours)
+      const erNow = await c.erUnix().catch(() => null);
+      if (erNow !== null && erNow < re.plannedStartUnix) { await sleep(300); return; }
       recorded = true;
     }
     // re-seal (setup_permissions, update path) every desk and the Book
@@ -438,6 +478,7 @@ export class Pool implements PoolView {
     const r = await c.sendEr([ix], { cu: 1_000_000 });
     if (!r.ok) { log.warn("open_failed", { pool: this.tableId, round: n, err: errText(r) }); await sleep(500); return; }
     const openAt = Date.now();
+    this.sendClosed = false;
     const humans = new Map<number, string>();
     t.seats.forEach((x, s) => { if (x.kind === SEAT.human) humans.set(s, x.key); });
     if (humans.size) this.humansAtOpen.set(n, humans);

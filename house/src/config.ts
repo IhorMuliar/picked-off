@@ -40,6 +40,21 @@ export interface HouseConfig {
   initConfig: boolean;
   logFile: string;
   rpcLogFile: string;
+  /** a log file is rotated (kept: `logKeep` older files) once it passes this size; 0 = never */
+  logMaxMb: number;
+  logKeep: number;
+  /** echo info lines to stdout too (warnings and errors always are) */
+  stdoutInfo: boolean;
+  /** below this house balance no new records are created (pools keep playing unrecorded); 0 = off */
+  minBalanceSol: number;
+  /** below this house balance a pool records at most one round per `lowRecordEverySec`, players seated or not; 0 = off */
+  softBalanceSol: number;
+  lowRecordEverySec: number;
+  /** the unseal waits until this long after the last bot send and after the bell (a late act must never land, or be
+   *  delivered, once the round is public) */
+  unsealQuietMs: number;
+  /** a base transaction with no status after this long (and an expired blockhash) counts as dropped and is sent again */
+  baseDropMs: number;
 }
 
 const home = os.homedir();
@@ -64,6 +79,14 @@ function defaults(cluster: Cluster): HouseConfig {
     bots: true,
     logFile: path.join(stateDir, `house-${cluster}.log`),
     rpcLogFile: path.join(stateDir, `house-${cluster}-rpc.jsonl`),
+    logMaxMb: 100,
+    logKeep: 3,
+    stdoutInfo: true,
+    minBalanceSol: cluster === "local" ? 0 : 6,
+    softBalanceSol: cluster === "local" ? 0 : 10,
+    lowRecordEverySec: 120,
+    unsealQuietMs: cluster === "local" ? 300 : 2_500,
+    baseDropMs: 90_000,
   };
   if (cluster === "local")
     return {
@@ -78,11 +101,12 @@ function defaults(cluster: Cluster): HouseConfig {
     };
   return {
     ...common,
-    baseRpc: "https://api.devnet.solana.com",
+    baseRpc: "https://rpc.magicblock.app/devnet",
     erRpc: "https://devnet-tee.magicblock.app",
     validator: "MTEWGuqxUpYZGFJQcp8tLN7x5v9BSeoFHYWQQ3n3xzo",
     houseKeypair: path.join(home, ".config/solana/blitz-ping-devnet.json"),
     pools: [1],
+    commitWaitMs: 60_000,
     oracleQueueFallback: "5hBR571xnXppuCPveTrctfTU7tJLSN94nq7kv7FRK5Tc",
     initConfig: false,
   };
@@ -95,18 +119,23 @@ const ENV: Record<string, [keyof HouseConfig, "s" | "n" | "b" | "list"]> = {
   MAX_ROUND_MS: ["maxRoundMs", "n"], COMMIT_WAIT_MS: ["commitWaitMs", "n"], TABLE_FLOAT_LAMPORTS: ["tableFloatLamports", "n"],
   ORACLE_QUEUE: ["oracleQueueFallback", "s"], HEALTH_PORT: ["healthPort", "n"], TEST_CALLS: ["testCalls", "b"], MAX_ROUNDS: ["maxRounds", "n"],
   BOTS: ["bots", "b"], INIT_CONFIG: ["initConfig", "b"], HOUSE_LOG: ["logFile", "s"], HOUSE_RPC_LOG: ["rpcLogFile", "s"],
+  HOUSE_LOG_MAX_MB: ["logMaxMb", "n"], HOUSE_LOG_KEEP: ["logKeep", "n"], HOUSE_STDOUT_INFO: ["stdoutInfo", "b"], MIN_BALANCE_SOL: ["minBalanceSol", "n"], SOFT_BALANCE_SOL: ["softBalanceSol", "n"], LOW_RECORD_EVERY_SEC: ["lowRecordEverySec", "n"], UNSEAL_QUIET_MS: ["unsealQuietMs", "n"], BASE_DROP_MS: ["baseDropMs", "n"],
 };
 
 export function loadConfig(env = process.env): HouseConfig {
   const cluster = (env.CLUSTER ?? "local") as Cluster;
   if (cluster !== "local" && cluster !== "devnet") throw new Error(`CLUSTER must be local or devnet, got ${cluster}`);
   let cfg = defaults(cluster);
-  if (env.HOUSE_CONFIG) cfg = { ...cfg, ...JSON.parse(fs.readFileSync(env.HOUSE_CONFIG, "utf8")) };
+  const file = env.HOUSE_CONFIG ? JSON.parse(fs.readFileSync(env.HOUSE_CONFIG, "utf8")) : {};
+  cfg = { ...cfg, ...file };
   for (const [name, [key, kind]] of Object.entries(ENV)) {
     const v = env[name];
     if (v === undefined || v === "") continue;
     (cfg as any)[key] = kind === "n" ? Number(v) : kind === "b" ? v === "1" || v === "true" : kind === "list" ? v.split(",").map((x) => Number(x.trim())) : v;
   }
   if (cluster !== "local") cfg.initConfig = false;
+  // runtime files follow STATE_DIR unless they are set on their own
+  if (!env.HOUSE_LOG && !file.logFile) cfg.logFile = path.join(cfg.stateDir, `house-${cluster}.log`);
+  if (!env.HOUSE_RPC_LOG && !file.rpcLogFile) cfg.rpcLogFile = path.join(cfg.stateDir, `house-${cluster}-rpc.jsonl`);
   return cfg;
 }

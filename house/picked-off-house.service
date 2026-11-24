@@ -1,24 +1,29 @@
-# PICKED OFF house runner. Not installed by the repository; to install:
-#   sudo cp house/picked-off-house.service /etc/systemd/system/
-#   sudo systemctl daemon-reload && sudo systemctl enable --now picked-off-house
-#   journalctl -u picked-off-house -f        curl -s 127.0.0.1:8788/healthz
-# The env file holds CLUSTER, BASE_RPC, ER_RPC, POOLS, HOUSE_KEYPAIR, BOT_KEYS_DIR, ... (house/.env.example).
-# Keys live outside the checkout (e.g. /opt/picked-off/keys), readable only by the service user.
+# PICKED OFF house runner. Not installed by the repository; to install (paths are examples):
+#   sudo cp house/picked-off-house.service house/picked-off-house-watchdog.* /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now picked-off-house picked-off-house-watchdog.timer
+#   curl -s 127.0.0.1:8788/healthz        tail -f /var/lib/picked-off/house-devnet.log
+# The env file holds CLUSTER, BASE_RPC, ER_RPC, POOLS, HOUSE_KEYPAIR, BOT_KEYS_DIR, STATE_DIR, ...
+# (house/.env.example). Keys live outside the checkout, readable only by the service user.
+# The log of record is the size-rotated file in STATE_DIR; only warnings and errors reach the journal.
 [Unit]
 Description=PICKED OFF house runner (house pools, bots, recorded rounds)
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 WorkingDirectory=/opt/picked-off
 EnvironmentFile=/opt/picked-off/house.env
-ExecStart=/usr/bin/npx tsx house/src/main.ts
+Environment=HOUSE_STDOUT_INFO=0
+ExecStart=/usr/bin/node --import tsx house/src/main.ts
 Restart=always
 RestartSec=5
 # SIGTERM stops the bots and releases the runner lock; a restart resumes from chain state
 KillSignal=SIGTERM
 TimeoutStopSec=10
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=300
 
 [Install]
 WantedBy=multi-user.target

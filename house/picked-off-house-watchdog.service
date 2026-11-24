@@ -1,0 +1,7 @@
+# Restarts picked-off-house when /healthz shows no round progress (house/watchdog.sh).
+[Unit]
+Description=PICKED OFF house runner watchdog
+
+[Service]
+Type=oneshot
+ExecStart=/opt/picked-off/house/watchdog.sh

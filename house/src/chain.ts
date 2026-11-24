@@ -13,7 +13,7 @@ import {
   getAuthToken, permissionPdaFromAccount, magicFeeVaultPdaFromValidator, DELEGATION_PROGRAM_ID,
 } from "@magicblock-labs/ephemeral-rollups-sdk";
 import type { HouseConfig } from "./config.ts";
-import { log } from "./log.ts";
+import { log, RotatingFile } from "./log.ts";
 
 const { AnchorProvider, Program, Wallet, BN } = anchor;
 export { BN, Keypair, PublicKey, SystemProgram };
@@ -106,12 +106,10 @@ export function decodeConfig(b: Buffer): ConfigView {
 }
 
 // ------------------------------------------------------------------ RPC with an access log (who read which account; checked by the I13 test)
-let rpcLog: fs.WriteStream | null = null;
-export function openRpcLog(file: string) {
+let rpcLog: RotatingFile | null = null;
+export function openRpcLog(file: string, maxMb = 0, keep = 3) {
   if (!file || file === "off") return;
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  rpcLog = fs.createWriteStream(file, { flags: "a" });
-  rpcLog.on("error", () => { rpcLog = null; });
+  rpcLog = new RotatingFile(file, maxMb * 1048576, keep, () => { rpcLog = null; });
 }
 function logRead(who: string, layer: string, method: string, accounts: string[], extra?: Record<string, unknown>) {
   rpcLog?.write(JSON.stringify({ t: Date.now(), who, layer, m: method, a: accounts, ...extra }) + "\n");
@@ -234,36 +232,99 @@ export class Chain {
   isDelegatedOwner(owner?: string) { return owner === DELEGATION_PROGRAM_ID.toBase58(); }
 
   // ---------------------------------------------------------------- sending
-  /** Signs, sends and polls until confirmed or failed. Preflight is on unless asked otherwise. */
-  async send(conn: Connection, ixs: TransactionInstruction[], signers: Keypair[], opts: { cu?: number; timeoutMs?: number; skipPreflight?: boolean; label?: string } = {}): Promise<SendResult> {
+  /** Signs, sends and polls until confirmed or failed. Preflight is on unless asked otherwise.
+   *  `untilExpired`: keep polling past `timeoutMs` until the blockhash has expired, so a tx reported as
+   *  dropped can no longer land (a re-send can then never race the first copy). */
+  async send(conn: Connection, ixs: TransactionInstruction[], signers: Keypair[], opts: { cu?: number; timeoutMs?: number; skipPreflight?: boolean; label?: string; untilExpired?: boolean } = {}): Promise<SendResult> {
     const tx = new Transaction();
     if (opts.cu) tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: opts.cu }));
     tx.add(...ixs);
     tx.feePayer = signers[0].publicKey;
     const t0 = performance.now();
     let sig = "";
+    let lastValid = 0;
     try {
-      tx.recentBlockhash = (await conn.getLatestBlockhash("confirmed")).blockhash;
+      const bh = await conn.getLatestBlockhash("confirmed");
+      tx.recentBlockhash = bh.blockhash;
+      lastValid = bh.lastValidBlockHeight;
       tx.sign(...signers);
       sig = await conn.sendRawTransaction(tx.serialize(), { skipPreflight: opts.skipPreflight ?? false, preflightCommitment: "confirmed", maxRetries: 3 });
     } catch (e: any) {
       return { sig, ms: performance.now() - t0, err: e?.message ?? String(e), ok: false, logs: e?.logs ?? null };
     }
     const deadline = t0 + (opts.timeoutMs ?? 30_000);
-    while (performance.now() < deadline) {
+    let lastHeightAt = 0;
+    for (let i = 0; ; i++) {
       const st = await conn.getSignatureStatuses([sig]).catch(() => null);
       const v = st?.value?.[0];
       if (v && (v.confirmationStatus === "confirmed" || v.confirmationStatus === "finalized" || v.err)) return { sig, ms: performance.now() - t0, err: v.err, ok: !v.err };
-      await sleep(60);
+      const now = performance.now();
+      if (now >= deadline) {
+        if (!opts.untilExpired) return { sig, ms: now - t0, err: "timeout", ok: false };
+        if (now - lastHeightAt > 2_000) {
+          lastHeightAt = now;
+          const h = await conn.getBlockHeight("confirmed").catch(() => 0);
+          if (h > lastValid) {
+            const fin = (await conn.getSignatureStatuses([sig], { searchTransactionHistory: true }).catch(() => null))?.value?.[0];
+            if (fin && (fin.confirmationStatus === "confirmed" || fin.confirmationStatus === "finalized" || fin.err)) return { sig, ms: performance.now() - t0, err: fin.err, ok: !fin.err };
+            return { sig, ms: now - t0, err: "dropped", ok: false };
+          }
+        }
+        if (now - t0 > 10 * 60_000) return { sig, ms: now - t0, err: "timeout", ok: false };
+      }
+      await sleep(i < 50 ? 60 : 500);
     }
-    return { sig, ms: performance.now() - t0, err: "timeout", ok: false };
   }
-  sendBase(ixs: TransactionInstruction[], opts: { cu?: number; label?: string; signers?: Keypair[] } = {}) {
-    return this.send(this.base, ixs, opts.signers ?? [this.house], { ...opts, skipPreflight: false });
+  /** Base transactions: preflight on; one with no status after `baseDropMs` (blockhash expired, so it can no
+   *  longer land) is sent once more with a fresh blockhash. */
+  async sendBase(ixs: TransactionInstruction[], opts: { cu?: number; label?: string; signers?: Keypair[] } = {}) {
+    this.baseTxs.sent++;
+    let r = await this.send(this.base, ixs, opts.signers ?? [this.house], { ...opts, skipPreflight: false, timeoutMs: this.cfg.baseDropMs, untilExpired: true });
+    if (r.err === "dropped") {
+      this.baseTxs.dropped++;
+      log.warn("base_tx_dropped", { label: opts.label, sig: r.sig, ms: Math.round(r.ms), note: "no status, blockhash expired: sent again" });
+      this.baseTxs.sent++;
+      r = await this.send(this.base, ixs, opts.signers ?? [this.house], { ...opts, skipPreflight: false, timeoutMs: this.cfg.baseDropMs, untilExpired: true });
+    }
+    if (!r.ok) {
+      // preflight refusals never land; a landed failure would show in the tx's status
+      if (r.err && typeof r.err !== "string") this.baseTxs.failedOnChain++;
+      else this.baseTxs.refused++;
+    }
+    return r;
   }
+  readonly baseTxs = { sent: 0, dropped: 0, refused: 0, failedOnChain: 0 };
   async sendEr(ixs: TransactionInstruction[], opts: { cu?: number; label?: string } = {}) {
     await this.ensureHouseToken();
     return this.send(this.er, ixs, [this.house], { ...opts, skipPreflight: false });
+  }
+
+  /** unix_timestamp of the rollup's Clock sysvar (open_round checks a record's planned start against it). */
+  async erUnix(): Promise<number | null> {
+    await this.ensureHouseToken();
+    const r = await rpc(this.erUrl(this.houseToken), "getAccountInfo", ["SysvarC1ock11111111111111111111111111111111", { encoding: "base64", commitment: "processed" }]);
+    const v = r.body?.result?.value;
+    return v ? Number(Buffer.from(v.data[0], "base64").readBigInt64LE(32)) : null;
+  }
+
+  // ---------------------------------------------------------------- house balance (low-balance guard)
+  balanceLamports: number | null = null;
+  balanceAt = 0;
+  async refreshBalance() {
+    const r = await rpc(this.cfg.baseRpc, "getBalance", [this.house.publicKey.toBase58(), { commitment: "confirmed" }]);
+    const v = r.body?.result?.value;
+    if (typeof v === "number") { this.balanceLamports = v; this.balanceAt = Date.now(); }
+    return this.balanceLamports;
+  }
+  /** True when the house balance is known to be below the soft threshold: records are spaced out. */
+  lowBalance() {
+    const soft = this.cfg.softBalanceSol;
+    return !!soft && this.balanceLamports !== null && this.balanceLamports < soft * 1e9;
+  }
+  /** False when the house balance is known to be below the guard: no new records. */
+  canRecord() {
+    const min = this.cfg.minBalanceSol;
+    return !min || this.balanceLamports === null || this.balanceLamports >= min * 1e9;
   }
 
   /** Polls `reader` until `acc` is owned by the program; ms it took, or null. */

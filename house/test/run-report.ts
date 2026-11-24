@@ -1,9 +1,9 @@
 // Summary of a house runner log: rounds, durations, warnings, records, and bot behaviour per personality.
-//   npx tsx house/test/run-report.ts <house log>
+//   npx tsx house/test/run-report.ts <house log> [since ISO time]
 import fs from "node:fs";
 
-const file = process.argv[2];
-const ev = fs.readFileSync(file, "utf8").split("\n").filter((l) => l.startsWith("{")).map((l) => JSON.parse(l));
+const [file, since] = process.argv.slice(2);
+const ev = fs.readFileSync(file, "utf8").split("\n").filter((l) => l.startsWith("{")).map((l) => JSON.parse(l)).filter((e) => !since || e.ts >= since);
 const rounds = ev.filter((e) => e.ev === "round");
 const pct = (xs: number[], p: number) => { const s = [...xs].sort((a, b) => a - b); return s.length ? s[Math.min(s.length - 1, Math.floor(p * s.length))] : null; };
 const dur = rounds.map((r) => r.roundMs).filter((x) => typeof x === "number");

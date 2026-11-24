@@ -95,7 +95,9 @@ export class Brain {
 
 // ------------------------------------------------------------------ the shared view a pool gives its bots (public Table only)
 export interface Snapshot { table: TableView; slot: number; at: number; slotMs: number }
-export interface PoolView { tableId: number; snap: Snapshot | null; book: PublicKey; blockhash(): string | null }
+export interface PoolView { tableId: number; snap: Snapshot | null; book: PublicKey; blockhash(): string | null; /** true from the moment the house sees the bell until the next open */ sendClosed: boolean }
+/** a bot sends only on a Table view at most this old (a stalled poll must never let it send into a revealed round) */
+const MAX_SNAP_AGE_MS = 700;
 
 interface RoundStats { reported?: boolean; round: number; sent: number; sendErr: number; firstSend: number; lastSend: number; pings: number; requotes: number; place: number; present: number; absent: number; rtSum: number; rtN: number; algo: number; fills: number; picked: number; final?: DeskView }
 
@@ -128,6 +130,8 @@ export class Bot {
   }
   get name() { return seatName(this.seat); }
   get running() { return !this.stopped && this.timer !== null; }
+  /** started or starting (the rollup login can take seconds) and not stopped */
+  get alive() { return !this.stopped; }
 
   private async ensureToken() {
     if (this.token && Date.now() < this.tokenExp - 60_000) return;
@@ -169,7 +173,7 @@ export class Bot {
     const t = snap.table;
     if (t.seats[this.seat].key !== this.key.publicKey.toBase58()) { this.stop(t.seats[this.seat].kind === 1 ? "seat taken by a player" : "seat no longer ours"); return; }
     if (t.round !== this.round) this.newRound(t.round);
-    const inPlay = t.phase === PHASE.hide || t.phase === PHASE.live;
+    const inPlay = (t.phase === PHASE.hide || t.phase === PHASE.live) && !this.pool.sendClosed && Date.now() - snap.at <= MAX_SNAP_AGE_MS;
     if (!inPlay) {
       if ((t.phase === PHASE.bell || t.phase === PHASE.revealed) && this.ready && this.stats && !this.stats.final && !this.reading) this.finalRead();
       return;
@@ -293,9 +297,12 @@ export class Bot {
     return Buffer.concat([Buffer.from([1]), sig, m]).toString("base64");
   }
 
+  /** sends not answered yet, and the time of the last send */
+  inflight = 0;
+  lastSendAt = 0;
   private sendAct(c: Choice) {
     const bh = this.pool.blockhash();
-    if (!bh || !this.stats) return;
+    if (!bh || !this.stats || this.pool.sendClosed) return;
     this.seq += 1;
     const raw = this.wire(bh, c, this.seq);
     const st = this.stats;
@@ -303,12 +310,15 @@ export class Bot {
     if (!st.firstSend) st.firstSend = now;
     st.lastSend = now;
     st.sent++;
+    this.lastSendAt = now;
+    this.inflight++;
     fetch(this.sendUrl, { method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "sendTransaction", params: [raw, { encoding: "base64", skipPreflight: true, maxRetries: 0 }] }) })
       .then(async (r) => {
         const j: any = await r.json().catch(() => null);
         if (!r.ok || j?.error) { st.sendErr++; if (r.status === 401) this.token = ""; }
       })
-      .catch(() => { st.sendErr++; });
+      .catch(() => { st.sendErr++; })
+      .finally(() => { this.inflight--; });
   }
 }

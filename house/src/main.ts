@@ -7,12 +7,13 @@ import http from "node:http";
 import { loadConfig } from "./config.ts";
 import { Chain, openRpcLog } from "./chain.ts";
 import { Pool } from "./pool.ts";
-import { log, openLog } from "./log.ts";
+import { log, openLog, quietStdoutInfo } from "./log.ts";
 
 const cfg = loadConfig();
 fs.mkdirSync(cfg.stateDir, { recursive: true });
-openLog(cfg.logFile);
-openRpcLog(cfg.rpcLogFile);
+openLog(cfg.logFile, cfg.logMaxMb, cfg.logKeep);
+openRpcLog(cfg.rpcLogFile, cfg.logMaxMb, cfg.logKeep);
+quietStdoutInfo(!cfg.stdoutInfo);
 
 // one runner per cluster and state dir: a second process would drive the same rounds twice
 const lockFile = path.join(cfg.stateDir, `house-${cfg.cluster}.pid`);
@@ -36,7 +37,9 @@ function diskFreeMb(): number | null {
 }
 function health() {
   const ps = pools.map((p) => p.health());
-  return { diskFreeMb: diskFreeMb(), ok: ps.every((p) => !p.stuck && (p.lastRoundAgeSec === null ? Date.now() - started < 180_000 : true)), cluster: cfg.cluster, house: chain.house.publicKey.toBase58(), uptimeSec: Math.round((Date.now() - started) / 1000), pools: ps };
+  const bal = chain.balanceLamports;
+  return { diskFreeMb: diskFreeMb(), ok: ps.every((p) => !p.stuck && (p.lastRoundAgeSec === null ? Date.now() - started < 180_000 : true)), cluster: cfg.cluster, house: chain.house.publicKey.toBase58(),
+    uptimeSec: Math.round((Date.now() - started) / 1000), balanceSol: bal === null ? null : bal / 1e9, recording: chain.canRecord(), recordSpacing: chain.lowBalance() ? cfg.lowRecordEverySec : null, minBalanceSol: cfg.minBalanceSol, softBalanceSol: cfg.softBalanceSol, baseTxs: chain.baseTxs, pools: ps };
 }
 const server = http.createServer((req, res) => {
   if (req.url?.startsWith("/healthz")) {
@@ -57,6 +60,19 @@ function shutdown(code: number, why: string) {
   try { if (fs.readFileSync(lockFile, "utf8").trim() === String(process.pid)) fs.unlinkSync(lockFile); } catch {}
   setTimeout(() => process.exit(code), 300);
 }
+// low-balance guard: below minBalanceSol no new records are created (the pools keep playing unrecorded)
+let softWas = false;
+async function balanceTick() {
+  const was = chain.canRecord();
+  await chain.refreshBalance().catch(() => null);
+  const bal = chain.balanceLamports;
+  if (!chain.canRecord()) log.error("low_balance", { balanceSol: (bal ?? 0) / 1e9, minSol: cfg.minBalanceSol, house: chain.house.publicKey.toBase58(), note: "LOW HOUSE BALANCE: new records stopped; top up the house wallet" });
+  else if (!was) log.warn("balance_ok_again", { balanceSol: (bal ?? 0) / 1e9 });
+  if (chain.canRecord() && chain.lowBalance() !== softWas) log.warn(chain.lowBalance() ? "balance_soft_low" : "balance_soft_ok", { balanceSol: (bal ?? 0) / 1e9, softSol: cfg.softBalanceSol, recordEverySecWithPlayers: chain.lowBalance() ? cfg.lowRecordEverySec : 0 });
+  softWas = chain.lowBalance();
+}
+void balanceTick();
+setInterval(() => void balanceTick(), 60_000).unref();
 setInterval(() => { const mb = diskFreeMb(); if (mb !== null && mb < 2048) log.warn("disk_low", { freeMb: mb, stateDir: cfg.stateDir }); }, 60_000).unref();
 process.on("SIGTERM", () => shutdown(0, "SIGTERM"));
 process.on("SIGINT", () => shutdown(0, "SIGINT"));

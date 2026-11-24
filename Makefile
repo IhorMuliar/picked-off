@@ -20,7 +20,7 @@ SPIKE_ENV  := CARGO_TARGET_DIR=$(CURDIR)/target
 
 .PHONY: all setup doctor build build-ping build-ping-local build-spike idl keys test test-svm app deploy-devnet devnet-version devnet-check-a5 \
         balance knowledge local-stack local-fund local-check-a1 local-check-a3 leak-probe-local leak-probe-devnet spike-local probe-tee clean-ledger \
-        hooks internal-status internal-commit internal-push house-local house-stop house-i13
+        hooks internal-status internal-commit internal-push house-local house-stop house-i13 house-status house-report
 
 all: build
 
@@ -153,7 +153,7 @@ leak-probe-local:
 	  npx tsx scripts/leak-probe.ts
 
 leak-probe-devnet:
-	CLUSTER=devnet LEAK_LOG=$$([ -d $(dir $(LEAK_LOG_DIR)) ] && echo $(LEAK_LOG_DIR)/leak-probe-devnet-$(LEAK_STAMP).log) \
+	CLUSTER=devnet LEAK_LOG=$$([ -d $(dir $(LEAK_LOG_DIR)) ] && echo $(LEAK_LOG_DIR)/leak-probe-devnet-$(LEAK_STAMP).txt) \
 	  npx tsx scripts/leak-probe.ts
 
 # ---- house runner (house/): pools, bots, records. Local: after local-stack + local-fund.
@@ -170,6 +170,17 @@ house-stop:
 # I13: on the rollup the runner read nothing but each bot's own Desk and the public Table.
 house-i13:
 	npx tsx house/src/i13-check.ts $(HOUSE_STATE)/house-$${CLUSTER:-local}-rpc.jsonl
+
+# Installed runner (house/picked-off-house.service): unit state, /healthz, the last warnings.
+HOUSE_PORT ?= 8788
+house-status:
+	@systemctl --no-pager --lines=0 status picked-off-house picked-off-house-watchdog.timer || true
+	@curl -s 127.0.0.1:$(HOUSE_PORT)/healthz | jq -c '{ok, uptimeSec, balanceSol, recording, baseTxs, pools: [.pools[] | {pool, round, phase, lastRoundAgeSec, rounds, aborts, reschedules, bots}]}'
+	@journalctl -u picked-off-house -u picked-off-house-watchdog --no-pager -n 5 -o cat
+
+# Rounds, timings, bots and records from the runner's log.
+house-report:
+	npx tsx house/test/run-report.ts $(HOUSE_STATE)/house-$${CLUSTER:-devnet}.log
 
 # ---- spike (local-only prototype, not included in this repository)
 
@@ -220,3 +231,9 @@ internal-commit:
 internal-push:
 	$(call local_only,.git-internal)
 	$(GIT_LOCAL) push origin main
+
+# browser-check: headless Chrome checks against a game URL (tests/browser)
+.PHONY: browser-check
+browser-check:
+	@test -n "$(URL)" || (echo 'usage: make browser-check URL=https://...' && exit 2)
+	node tests/browser/check.mjs $(URL)
