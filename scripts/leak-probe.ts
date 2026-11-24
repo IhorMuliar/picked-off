@@ -16,8 +16,9 @@
 //   WALLET        house keypair (must equal Config.house)
 //   PROGRAM_ID    program id (must match the build)
 //   TABLE_ID      table id of the probe pool (>= 70; default 7_000_000 + unix % 1e6, a fresh pool)
+//   REUSE         1: reuse the existing probe pool TABLE_ID (created by an earlier run, REVEALED or IDLE)
 //   ROUNDS        rounds to drive (default 3, minimum 3)
-//   HOUSE_POOL    house pool table id for read-only probes ("" to skip; default 1001)
+//   HOUSE_POOL    house pool table id for read-only probes ("" to skip; default 1001, devnet 1)
 //   HOUSE_RPC_LOG house runner RPC log for L17
 //   LEAK_LOG      write the full output to this file
 // Prints one line per assertion: PASS / FAIL / SKIP / LOCAL-EXPECTED / INFO with its evidence.
@@ -30,8 +31,8 @@ import { spawnSync } from "node:child_process";
 import { SystemProgram, Transaction, TransactionInstruction, Keypair, PublicKey, Connection } from "@solana/web3.js";
 import bs58 from "bs58";
 import nacl from "tweetnacl";
-import { getAuthToken, MAGIC_PROGRAM_ID } from "@magicblock-labs/ephemeral-rollups-sdk";
-import { PROGRAM_ID, KIND, PHASE, NDESK, BN, pda, sleep, loadKeypair, rpc, readAccount, programOn, send, loadIdl, predictableTaskId, callPda, REPO, type SendResult } from "../tests/local/lib.ts";
+import { getAuthToken, MAGIC_PROGRAM_ID, magicFeeVaultPdaFromValidator } from "@magicblock-labs/ephemeral-rollups-sdk";
+import { PROGRAM_ID, KIND, PHASE, NDESK, BN, pda, sleep, loadKeypair, rpc, readAccount, programOn, send, loadIdl, predictableTaskId, callPda, decodeTape, REPO, type SendResult } from "../tests/local/lib.ts";
 import { Report, Sub, txShape, redacted, hist, spread, pool } from "./leak-probe-util.ts";
 
 // ------------------------------------------------------------------ config
@@ -48,7 +49,8 @@ const CFG = {
   programId: env("PROGRAM_ID", PROGRAM_ID.toBase58()),
   tableId: Number(env("TABLE_ID", String(7_000_000 + (Math.floor(Date.now() / 1000) % 1_000_000)))),
   rounds: Math.max(3, Number(env("ROUNDS", "3"))),
-  housePool: env("HOUSE_POOL", "1001"),
+  housePool: env("HOUSE_POOL", DEV ? "1" : "1001"),
+  reuse: env("REUSE", "") === "1",
   houseRpcLog: env("HOUSE_RPC_LOG", path.join(os.homedir(), ".local/state/picked-off", `house-${CLUSTER}-rpc.jsonl`)),
   log: env("LEAK_LOG", ""),
 };
@@ -56,12 +58,13 @@ const CFG = {
 const LOCAL_ER_QUEUE = new PublicKey("Sc9MJUngNbQXSXGP3F67KvKwVnhaYn6kcioxXNVowYT");
 const MEMO = new PublicKey("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
 const CRANK_LINE = "Program Crank11111111111111111111111111111111111111 invoke [1]";
+const VRF_PROGRAM = "Vrf1RNUjXmQGjmQrQLvJHs9SNkvDJEsRVFPkfSQUwGz";
 const ACT_MS = 250;
 
 const R = new Report();
 const IDL = loadIdl();
 const disc = (name: string) => Buffer.from(IDL.instructions.find((i: any) => i.name === name).discriminator);
-const ACT_DISC = disc("act"), TICK_DISC = disc("tick");
+const ACT_DISC = disc("act"), TICK_DISC = disc("tick"), VRF_CB_DISC = disc("vrf_callback");
 const ERRNAME: Record<number, string> = Object.fromEntries((IDL.errors ?? []).map((e: any) => [e.code, e.name]));
 Object.assign(ERRNAME, { 3012: "AccountNotInitialized", 2006: "ConstraintSeeds", 3007: "AccountOwnedByWrongProgram", 3001: "AccountDiscriminatorNotFound" });
 
@@ -135,9 +138,48 @@ function errName(err: any): string {
   if (!err) return "ok";
   const c = err?.InstructionError?.[1]?.Custom;
   if (typeof c === "number") return ERRNAME[c] ?? `Custom(${c})`;
+  if (typeof err === "string") { // a preflight refusal (simulation error message)
+    const hex = err.match(/custom program error: 0x([0-9a-f]+)/i);
+    if (hex) { const n = parseInt(hex[1], 16); return `${ERRNAME[n] ?? `Custom(${n})`} (preflight)`; }
+    if (/already in use/.test(err)) return "AccountAlreadyInUse (preflight)";
+  }
   return JSON.stringify(err).slice(0, 60);
 }
-async function slotNow(): Promise<number> { return Number((await rpc(erUrl(tH), "getSlot", [{ commitment: "confirmed" }])).body?.result ?? 0); }
+// ------------------------------------------------------------------ RPC with back-off, senders
+/** HTTP 429 answers seen (shared devnet RPCs): every one is retried after a back-off and counted. */
+const rateLimited: { n: number; method: Record<string, number> } = { n: 0, method: {} };
+async function rpcB(url: string, method: string, params: unknown[] = []): Promise<{ http: number; body: any }> {
+  for (let i = 0; ; i++) {
+    const r = await rpc(url, method, params);
+    if (r.http !== 429 || i >= 6) return r;
+    rateLimited.n++; rateLimited.method[method] = (rateLimited.method[method] ?? 0) + 1;
+    await sleep(500 * 2 ** i);
+  }
+}
+/** Base-layer house/bettor txs. Devnet: preflight on (a failing tx is refused, never lands), 90 s to confirm,
+ *  a dropped tx is sent again; the house wallet's balance change is taken from each tx's own meta. */
+const baseTxs: { label: string; sig: string; ok: boolean; houseDelta: number }[] = [];
+async function baseSend(ixs: TransactionInstruction[], signers: Keypair[], label: string): Promise<SendResult> {
+  if (!DEV) return send(base, ixs, signers);
+  let r = await send(base, ixs, signers, { skipPreflight: false, timeoutMs: 90_000 });
+  for (let i = 0; i < 2 && !r.ok && r.err === "timeout"; i++) {
+    const st = (await rpcB(CFG.base, "getSignatureStatuses", [[r.sig], { searchTransactionHistory: true }])).body?.result?.value?.[0];
+    if (st) { r = { ...r, ok: !st.err, err: st.err }; break; }
+    R.log(`warn   base ${label}: no status after 90 s (dropped), sent again`);
+    r = await send(base, ixs, signers, { skipPreflight: false, timeoutMs: 90_000 });
+  }
+  let houseDelta = 0;
+  if (r.sig && r.ok) {
+    const t = (await rpcB(CFG.base, "getTransaction", [r.sig, { encoding: "json", commitment: "confirmed", maxSupportedTransactionVersion: 0 }])).body?.result;
+    const i = (t?.transaction?.message?.accountKeys ?? []).indexOf(house.publicKey.toBase58());
+    if (i >= 0) houseDelta = t.meta.postBalances[i] - t.meta.preBalances[i];
+  }
+  baseTxs.push({ label, sig: r.sig, ok: r.ok, houseDelta });
+  return r;
+}
+/** House txs on the rollup: devnet with preflight on, like the house runner. */
+const erSend = (ixs: TransactionInstruction[], cu: number) => send(erH, ixs, [house], DEV ? { cu, skipPreflight: false, timeoutMs: 30_000 } : { cu });
+async function slotNow(): Promise<number> { return Number((await rpcB(erUrl(tH), "getSlot", [{ commitment: "confirmed" }])).body?.result ?? 0); }
 async function readTable(): Promise<{ v: TableV; bytes: Buffer } | null> {
   const a = await readAccount(CFG.er, table);
   return a.data ? { v: decT(a.data), bytes: a.data } : null;
@@ -149,13 +191,13 @@ async function waitFor<X>(fn: () => Promise<X | null | undefined | false>, ms: n
 }
 async function getTx(url: string, sig: string, tries = 1): Promise<any> {
   for (let i = 0; i < tries; i++) {
-    const r = await rpc(url, "getTransaction", [sig, { encoding: "json", maxSupportedTransactionVersion: 0, commitment: "confirmed" }]);
+    const r = await rpcB(url, "getTransaction", [sig, { encoding: "json", maxSupportedTransactionVersion: 0, commitment: "confirmed" }]);
     if (r.body?.result || i === tries - 1) return r.body;
     await sleep(500);
   }
 }
 async function sigList(url: string, addr: PublicKey, limit = 1000): Promise<string[]> {
-  const r = await rpc(url, "getSignaturesForAddress", [addr.toBase58(), { limit, commitment: "confirmed" }]);
+  const r = await rpcB(url, "getSignaturesForAddress", [addr.toBase58(), { limit, commitment: "confirmed" }]);
   return (r.body?.result ?? []).map((x: any) => x.signature);
 }
 const progCu = (logs: string[]) => Number(logs.map((l) => l.match(new RegExp(`^Program ${PROGRAM_ID.toBase58()} consumed (\\d+) of`))).find(Boolean)?.[1] ?? -1);
@@ -205,8 +247,12 @@ function content(n: number, s: number, phase: number, k: number): { kind: number
 // ------------------------------------------------------------------ round state shared by the loops
 type Snap = { t: number; slot: number; v: TableV; bytes: Buffer };
 type RoundRun = {
-  n: number; openSig: string; open: TableV; snaps: Snap[]; latest: TableV | null; deskSeen: Set<number>[]; deskLatest: (ReturnType<typeof decD> | null)[];
+  n: number; /** round number on chain */ i: number; /** 1-based index of the round in this run (drives the scripted hidden states) */
+  openSig: string; open: TableV; snaps: Snap[]; latest: TableV | null; deskSeen: Set<number>[]; deskLatest: (ReturnType<typeof decD> | null)[];
   stop: boolean; squat: bigint[]; squatOk: boolean[]; final?: TableV; joinSig?: string; ticks?: any[]; lagMax: number;
+  vrfSig?: string; midLists?: Record<string, string[]>; l4mid?: { ok: boolean; views: Record<string, any>; liveTick: boolean };
+  times?: { open: number; bell: number; revealSent: number; revealConfirmed: number; revealSeen: number };
+  preRevealTickVrf?: number;
 };
 
 async function monitor(rr: RoundRun) {
@@ -246,7 +292,7 @@ async function playerLoop(rr: RoundRun, s: number) {
     k++;
     if (!gate(rr, s) || !blockhash) continue;
     const ph = rr.latest!.phase;
-    const c = content(rr.n, s, ph, k);
+    const c = content(rr.i, s, ph, k);
     const seq = c.stale ? Math.max(1, seqOf[s] - 3) : ++seqOf[s];
     sendAct(kp, t, { round: rr.n, desk: s, who: "player", cls: c.cls, kind: c.kind, level: c.level, seq, phase: ph }, desks[s]);
   }
@@ -263,60 +309,80 @@ async function strangerLoop(rr: RoundRun) {
 }
 async function blockhashLoop(stop: () => boolean) {
   while (!stop()) {
-    const r = await rpc(erUrl(tH), "getLatestBlockhash", [{ commitment: "confirmed" }]);
+    const r = await rpcB(erUrl(tH), "getLatestBlockhash", [{ commitment: "confirmed" }]);
     if (r.body?.result?.value?.blockhash) blockhash = r.body.result.value.blockhash;
     await sleep(1000);
   }
 }
 
 // ------------------------------------------------------------------ pool setup (own pool)
-async function setupPool() {
+async function setupPool(): Promise<{ vrfQueue: PublicKey; round0: number }> {
   if (!(T >= 70)) throw new Error(`TABLE_ID ${T}: the probe pool needs a table id >= 70`);
   if (CFG.programId !== PROGRAM_ID.toBase58()) throw new Error(`PROGRAM_ID ${CFG.programId} does not match the build ${PROGRAM_ID.toBase58()}`);
   const cfg = await readAccount(CFG.base, pda.config());
   if (!cfg.data) throw new Error("no Config on the base layer");
   const cfgHouse = new PublicKey(cfg.data.subarray(96, 128)).toBase58();
   if (cfgHouse !== house.publicKey.toBase58()) throw new Error(`WALLET ${house.publicKey.toBase58()} is not Config.house ${cfgHouse}`);
-  const vrfQueue = new PublicKey(cfg.data.subarray(160, 192));
+  const vrfQueue0 = new PublicKey(cfg.data.subarray(160, 192));
+  const vrfQueue = vrfQueue0.equals(PublicKey.default) ? LOCAL_ER_QUEUE : vrfQueue0;
   const existing = await readAccount(CFG.base, table);
-  if (existing.data) throw new Error(`table ${T} already exists; pick a fresh TABLE_ID`);
+  const joinBots = async (from: number) => {
+    for (let s = from; s < NDESK; s += 4) {
+      const ixs = [];
+      for (let j = s; j < Math.min(NDESK, s + 4); j++) {
+        const name = Buffer.alloc(16); name.write(`PROBE-${j}`);
+        ixs.push(await ix(progEr.methods.joinBot(j, players[j].publicKey, 2, Array.from(name)).accountsPartial({ house: house.publicKey, table, desk: desks[j], permission: pda.perm(desks[j]) })));
+      }
+      must(await erSend(ixs, 1_000_000), `join_bot ${s}`);
+    }
+  };
+  if (existing.data) {
+    if (!CFG.reuse) throw new Error(`table ${T} already exists; pick a fresh TABLE_ID or set REUSE=1`);
+    // reuse: the pool stays delegated; re-seat every desk with this run's keys (join_bot works in IDLE/REVEALED)
+    const t = await readTable();
+    if (!t) throw new Error(`table ${T} is not on the rollup`);
+    if (t.v.phase !== PHASE.idle && t.v.phase !== PHASE.revealed) throw new Error(`table ${T} is in phase ${t.v.phase}; reuse needs IDLE or REVEALED`);
+    if (new PublicKey(t.bytes.subarray(152, 184)).toBase58() !== house.publicKey.toBase58()) throw new Error(`table ${T} belongs to another house`);
+    const open = await readAccount(CFG.base, pda.round(T, t.v.round));
+    if (t.v.round > 0 && open.data) throw new Error(`table ${T}: Round ${t.v.round} is still open on the base layer; close it first`);
+    R.log(`setup  reuse pool ${T}  table ${table.toBase58()}  last round ${t.v.round}  phase ${t.v.phase}  cluster ${CLUSTER}`);
+    // seat 0 goes to a throwaway bot so that A can take it with `join` in the first round, as in a fresh pool
+    const name = Buffer.alloc(16); name.write("PROBE-0");
+    must(await erSend([await ix(progEr.methods.joinBot(0, Keypair.generate().publicKey, 2, Array.from(name)).accountsPartial({ house: house.publicKey, table, desk: desks[0], permission: pda.perm(desks[0]) }))], 1_000_000), "join_bot 0");
+    await joinBots(1);
+    return { vrfQueue, round0: t.v.round };
+  }
+  if (CFG.reuse) throw new Error(`REUSE=1 but table ${T} does not exist`);
   R.log(`setup  pool ${T}  table ${table.toBase58()}  program ${PROGRAM_ID.toBase58()}  cluster ${CLUSTER}`);
-  must(await send(base, [await ix(progBase.methods.createPool(new BN(T), 0, new BN(50_000_000)).accountsPartial({ house: house.publicKey, config: pda.config(), table, book, ledger: pda.ledger(T) }))], [house]), "create_pool");
+  must(await baseSend([await ix(progBase.methods.createPool(new BN(T), 0, new BN(50_000_000)).accountsPartial({ house: house.publicKey, config: pda.config(), table, book, ledger: pda.ledger(T) }))], [house], "create_pool"), "create_pool");
   for (let s = 0; s < NDESK; s += 4) {
     const ixs = [];
     for (let j = s; j < s + 4; j++) ixs.push(await ix(progBase.methods.createDesk(new BN(T), j).accountsPartial({ house: house.publicKey, config: pda.config(), table, desk: desks[j] })));
-    must(await send(base, ixs, [house]), `create_desk ${s}`);
+    must(await baseSend(ixs, [house], `create_desk ${s}`), `create_desk ${s}`);
   }
   const targets: [number, number, PublicKey][] = [[KIND.table, 0, table], [KIND.book, 0, book], ...desks.map((d, s) => [KIND.desk, s, d] as [number, number, PublicKey])];
   await Promise.all(targets.map(async ([kind, idx, acc]) => {
-    must(await send(base, [await ix(progBase.methods.delegate(kind, new BN(T), new BN(idx)).accountsPartial({ house: house.publicKey, config: pda.config(), pda: acc, validator: CFG.validator }))], [house]), `delegate ${kind}/${idx}`);
+    must(await baseSend([await ix(progBase.methods.delegate(kind, new BN(T), new BN(idx)).accountsPartial({ house: house.publicKey, config: pda.config(), pda: acc, validator: CFG.validator }))], [house], `delegate ${kind}/${idx}`), `delegate ${kind}/${idx}`);
   }));
   for (const [, , acc] of targets) if (!(await waitFor(async () => { const a = await readAccount(erUrl(tH), acc); return a.data && a.owner === PROGRAM_ID.toBase58(); }, 20_000))) throw new Error(`${acc.toBase58()} not visible on the rollup`);
   const permIx = async (kind: number, idx: number, target: PublicKey | null) =>
     ix(progEr.methods.setupPermissions(kind, new BN(idx)).accountsPartial({ house: house.publicKey, table, target, permission: pda.perm(target ?? table) }));
   const items: [number, number, PublicKey | null][] = [[KIND.table, 0, null], [KIND.book, 0, book], ...desks.map((d, s) => [KIND.desk, s, d] as [number, number, PublicKey])];
-  for (let i = 0; i < items.length; i += 3) must(await send(erH, await Promise.all(items.slice(i, i + 3).map(([k, s, t]) => permIx(k, s, t))), [house], { cu: 1_000_000 }), `setup_permissions ${i}`);
+  for (let i = 0; i < items.length; i += 3) must(await erSend(await Promise.all(items.slice(i, i + 3).map(([k, s, t]) => permIx(k, s, t))), 1_000_000), `setup_permissions ${i}`);
   // seats 1..7: scripted players seated by the house; seat 0 stays empty until A joins in round 1
-  for (let s = 1; s < NDESK; s += 4) {
-    const ixs = [];
-    for (let j = s; j < Math.min(NDESK, s + 4); j++) {
-      const name = Buffer.alloc(16); name.write(`PROBE-${j}`);
-      ixs.push(await ix(progEr.methods.joinBot(j, players[j].publicKey, 2, Array.from(name)).accountsPartial({ house: house.publicKey, table, desk: desks[j], permission: pda.perm(desks[j]) })));
-    }
-    must(await send(erH, ixs, [house], { cu: 1_000_000 }), `join_bot ${s}`);
-  }
-  return { vrfQueue: vrfQueue.equals(PublicKey.default) ? LOCAL_ER_QUEUE : vrfQueue };
+  await joinBots(1);
+  return { vrfQueue, round0: 0 };
 }
 async function reseal() {
   const permIx = async (kind: number, idx: number, target: PublicKey) =>
     ix(progEr.methods.setupPermissions(kind, new BN(idx)).accountsPartial({ house: house.publicKey, table, target, permission: pda.perm(target) }));
   const items: [number, number, PublicKey][] = [[KIND.book, 0, book], ...desks.map((d, s) => [KIND.desk, s, d] as [number, number, PublicKey])];
-  for (let i = 0; i < items.length; i += 3) must(await send(erH, await Promise.all(items.slice(i, i + 3).map(([k, s, t]) => permIx(k, s, t))), [house], { cu: 1_000_000 }), `re-seal ${i}`);
+  for (let i = 0; i < items.length; i += 3) must(await erSend(await Promise.all(items.slice(i, i + 3).map(([k, s, t]) => permIx(k, s, t))), 1_000_000), `re-seal ${i}`);
 }
 async function unseal() {
   const items: [number, number, PublicKey][] = [[KIND.book, 0, book], ...desks.map((d, s) => [KIND.desk, s, d] as [number, number, PublicKey])];
   for (let i = 0; i < items.length; i += 3)
-    must(await send(erH, await Promise.all(items.slice(i, i + 3).map(([k, s, t]) => ix(progEr.methods.unseal(k, new BN(s)).accountsPartial({ house: house.publicKey, table, target: t, permission: pda.perm(t) })))), [house], { cu: 1_000_000 }), `unseal ${i}`);
+    must(await erSend(await Promise.all(items.slice(i, i + 3).map(([k, s, t]) => ix(progEr.methods.unseal(k, new BN(s)).accountsPartial({ house: house.publicKey, table, target: t, permission: pda.perm(t) })))), 1_000_000), `unseal ${i}`);
 }
 function joinIx(kp: Keypair, seat: number) {
   const name = Buffer.alloc(16); name.write("PROBE-A");
@@ -345,7 +411,7 @@ async function probeL1(rr: RoundRun) {
   const aOwn = await read(r.A, desks[A]), aBook = await read(r.A, book);
   const tableId = bs58.encode(le(T, 8));
   const gpa = async (t: string | undefined, size: number): Promise<number | string> => {
-    const r = await rpc(erUrl(t), "getProgramAccounts", [PROGRAM_ID.toBase58(), { encoding: "base64", filters: [{ dataSize: size }, { memcmp: { offset: 8, bytes: tableId } }] }]);
+    const r = await rpcB(erUrl(t), "getProgramAccounts", [PROGRAM_ID.toBase58(), { encoding: "base64", filters: [{ dataSize: size }, { memcmp: { offset: 8, bytes: tableId } }] }]);
     return Array.isArray(r.body?.result) ? r.body.result.length : `refused: ${JSON.stringify(r.body?.error ?? r.http).slice(0, 60)}`;
   };
   const none = (x: number | string) => x === 0 || typeof x === "string";
@@ -353,13 +419,17 @@ async function probeL1(rr: RoundRun) {
   const ok = !res.anonData.length && !res.OData.length && !res.BData.length && aOwn && !aBook && none(g.anonDesks) && none(g.anonBook) && none(g.ODesks) && none(g.OBook) && (typeof g.BDesks === "string" || g.BDesks <= 1);
   R.check("L1", ok, `round ${rr.n} beat ${rr.latest?.beat}: Book + other Desks as B, O (token) and anon; getProgramAccounts`, { nonNullForB: res.BData, nonNullForO: res.OData, nonNullForAnon: res.anonData, AownDesk: aOwn, ABook: aBook, gpa: g });
 }
+let houseProbed = false, houseTries = 0;
+/** Read-only: tried in every round until the house pool is caught in play (it runs on its own schedule). */
 async function probeHousePool() {
-  if (!CFG.housePool) return R.add("L1.house", "SKIP", "house pool read-only probe", "HOUSE_POOL empty");
+  houseTries++;
+  const last = houseTries >= CFG.rounds;
+  if (!CFG.housePool) { houseProbed = true; return R.add("L1.house", "SKIP", "house pool read-only probe", "HOUSE_POOL empty"); }
   const hT = Number(CFG.housePool);
   const t = await readAccount(CFG.er, pda.table(hT));
-  if (!t.data) return R.add("L1.house", "SKIP", `house pool ${hT}`, "Table not found on the rollup");
+  if (!t.data) { if (last) R.add("L1.house", "SKIP", `house pool ${hT}`, "Table not found on the rollup"); return; }
   const v = decT(t.data);
-  if (v.phase < PHASE.hide || v.phase > PHASE.bell) return R.add("L1.house", "SKIP", `house pool ${hT}`, `phase ${v.phase}: not in play right now`);
+  if (v.phase < PHASE.hide || v.phase > PHASE.bell) { if (last) R.add("L1.house", "SKIP", `house pool ${hT}`, `phase ${v.phase} (round ${v.round}): not in play at any of ${houseTries} tries`); return; }
   const r = ROLES();
   const hits: string[] = [];
   for (const [who, tk] of [["anon", r.anon], ["O", r.O]] as const) {
@@ -368,6 +438,8 @@ async function probeHousePool() {
   }
   const after = decT((await readAccount(CFG.er, pda.table(hT))).data!);
   const stillPlaying = after.round === v.round && after.phase >= PHASE.hide && after.phase <= PHASE.bell;
+  if (hits.length && !stillPlaying && !last) return;
+  houseProbed = true;
   R.add("L1.house", hits.length === 0 ? "PASS" : stillPlaying ? "FAIL" : "SKIP", `house pool ${hT} round ${v.round} (phase ${v.phase}, read-only): Book + 8 Desks as anon and O`, { nonNull: hits, roundStillInPlay: stillPlaying });
 }
 function pickA(rr: RoundRun, ageMs = 1500) {
@@ -393,17 +465,21 @@ async function probeL3(rr: RoundRun) {
   }
   R.check("L3", ok, `round ${rr.n}: getTransaction of A's acts (${Object.keys(sigs).join(", ")}) as anon, A, B, O`, views);
 }
-async function probeL4(rr: RoundRun, obs: Obs) {
+/** L4 during the round: open_round / join (and, locally, a tick from the raw list; on devnet a tick only if a log
+ *  stream already delivered one live) as anon, A, B, O. Plus the previous round's ticks and VRF callback, read
+ *  now that the re-seal has hidden that round again. */
+async function probeL4mid(rr: RoundRun, obs: Obs, prev: RoundRun | null) {
   const items: Record<string, string> = { open_round: rr.openSig };
   if (rr.joinSig) items.join = rr.joinSig;
+  let liveTick = false;
   if (CFG.raw) {
     for (const s of await sigList(CFG.raw, table, 40)) {
       const t = await getTx(CFG.raw, s);
       if ((t?.result?.meta?.logMessages ?? []).includes(CRANK_LINE)) { items.tick = s; break; }
     }
   } else {
-    const n = obs.all.flatMap((x) => x.notes).find((x) => (x.v?.value?.logs ?? []).includes(CRANK_LINE) && (x.v?.value?.logs ?? []).some((l: string) => l.includes(PROGRAM_ID.toBase58())));
-    if (n) items.tick = n.v.value.signature;
+    const n = [...obs.logs, ...obs.all].flatMap((x) => x.notes).find((x) => (x.v?.value?.logs ?? []).includes(CRANK_LINE) && (x.v?.value?.logs ?? []).some((l: string) => l.includes(PROGRAM_ID.toBase58())));
+    if (n) { items.tick = n.v.value.signature; liveTick = true; }
   }
   const views: Record<string, any> = {};
   let ok = true;
@@ -412,19 +488,58 @@ async function probeL4(rr: RoundRun, obs: Obs) {
     ok &&= Object.values(sh).every(redacted);
     views[what] = Object.fromEntries(Object.entries(sh).map(([w, s]) => [w, `${s.kind} k${s.keys} i${s.ixs} l${s.logs}`]));
   }
-  R.add("L4", !ok ? "FAIL" : items.tick ? "PASS" : DEV ? "SKIP" : "FAIL", `round ${rr.n}: getTransaction of tick, open_round${rr.joinSig ? ", join" : ""} during the round as anon, A, B, O`, { ...views, tickSigSource: CFG.raw ? "raw rollup list" : items.tick ? "log stream sample" : "no tick in the log stream sample yet" });
-  R.add("L4.vrf", "SKIP", "VRF fulfil redacted", DEV ? "fulfil signature only visible through the log stream; read from the house's own list" : "local stack: VRF off (fallback seed), no fulfil tx");
+  rr.l4mid = { ok, views, liveTick };
+  if (CFG.raw) R.add("L4", ok && !!items.tick ? "PASS" : "FAIL", `round ${rr.n}: getTransaction of tick, open_round${rr.joinSig ? ", join" : ""} during the round as anon, A, B, O`, { ...views, tickSigSource: "raw rollup list" });
+  if (CFG.raw) R.add("L4.vrf", "SKIP", "VRF fulfil redacted", "local stack: VRF off (fallback seed), no fulfil tx");
+  if (DEV && prev) await probeL4resealed(prev, `mid-round ${rr.n}`);
+}
+/** The previous round's ticks (a resolving and a no-op one) and its VRF callback, as anon, A, B, O, after the re-seal. */
+async function probeL4resealed(prev: RoundRun, when: string) {
+  const ts = (prev.ticks ?? []).slice().sort((a, b) => b.pcu - a.pcu);
+  const pick: Record<string, string> = {};
+  if (ts.length) { pick.resolving = ts[0].sig; pick.noop = ts[ts.length - 1].sig; }
+  const views: Record<string, any> = {};
+  let ok = ts.length > 0;
+  for (const [what, sig] of Object.entries(pick)) {
+    const sh = await shapes(sig);
+    ok &&= Object.values(sh).every(redacted);
+    views[what] = Object.fromEntries(Object.entries(sh).map(([w, s]) => [w, `${s.kind} k${s.keys} i${s.ixs} l${s.logs}`]));
+  }
+  R.check("L4.tick", ok, `round ${prev.n}'s crank ticks, ${when} (after the re-seal): getTransaction as anon, A, B, O`, { ...views, ticksKnown: ts.length });
+  if (!prev.vrfSig) return R.add("L4.vrf", "FAIL", `round ${prev.n}'s VRF callback, ${when}`, "callback tx not found in the Table's history after the reveal");
+  const sh = await shapes(prev.vrfSig);
+  const v = Object.fromEntries(Object.entries(sh).map(([w, s]) => [w, `${s.kind} k${s.keys} i${s.ixs} l${s.logs}`]));
+  R.check("L4.vrf", Object.values(sh).every(redacted), `round ${prev.n}'s VRF callback, ${when} (after the re-seal): getTransaction as anon, A, B, O`, { vrf_callback: v, sig: prev.vrfSig.slice(0, 12) });
+}
+/** L4 after the reveal (devnet): the round's ticks and VRF callback were in nobody's signature list mid-round and no log
+ *  stream delivered one before the reveal, so no non-member could even name them while private; open_round/join shells. */
+function probeL4post(rr: RoundRun) {
+  if (CFG.raw) return;
+  const tickSigs = new Set((rr.ticks ?? []).map((t) => t.sig));
+  if (rr.vrfSig) tickSigs.add(rr.vrfSig);
+  const listed: Record<string, number> = {};
+  for (const [k, xs] of Object.entries(rr.midLists ?? {})) { const c = xs.filter((s) => tickSigs.has(s)).length; if (c) listed[k] = c; }
+  const nListed = Object.values(listed).reduce((a, b) => a + b, 0);
+  const m = rr.l4mid!;
+  const ok = m.ok && nListed === 0 && (rr.preRevealTickVrf ?? 0) === 0 || (m.ok && m.liveTick && nListed === 0);
+  R.check("L4", ok && tickSigs.size > 0, `round ${rr.n}: open_round${rr.joinSig ? ", join" : ""} shells during the round to anon, A, B, O; its ticks and VRF callback named by no signature list mid-round and no log stream before the reveal`,
+    { ...m.views, ticks: (rr.ticks ?? []).length, vrfCallback: !!rr.vrfSig, listedMidRound: listed, deliveredBeforeReveal: rr.preRevealTickVrf ?? 0, liveTickFromStream: m.liveTick, listsChecked: Object.keys(rr.midLists ?? {}).length });
 }
 async function probeL5list(rr: RoundRun) {
   const r = ROLES();
   const aSigs = new Set(sent.filter((x) => x.round === rr.n && x.desk === A && x.who === "player").map((x) => x.sig));
   const res: Record<string, number> = {};
-  for (const [who, t] of [["anon", r.anon], ["B", r.B]] as const)
-    for (const [name, acc] of [["program", PROGRAM_ID], ["Aburner", players[A].publicKey], ["deskA", desks[A]], ["table", table], ["book", book]] as const)
-      res[`${who}:${name}`] = (await sigList(erUrl(t), acc)).filter((s) => aSigs.has(s)).length;
+  const jobs: [string, string | undefined, PublicKey][] = [];
+  for (const [who, t] of [["anon", r.anon], ["B", r.B], ["O", r.O]] as const)
+    for (const [name, acc] of [["program", PROGRAM_ID], ["Aburner", players[A].publicKey], ["deskA", desks[A]], ["table", table], ["book", book]] as const) jobs.push([`${who}:${name}`, t, acc]);
+  if (DEV) for (const [name, acc] of [["program", PROGRAM_ID], ["table", table], ["book", book]] as const) jobs.push([`A:${name}`, r.A, acc]);
+  const lists: Record<string, string[]> = {};
+  await pool(jobs, 4, async ([k, t, acc]) => { lists[k] = await sigList(erUrl(t), acc); });
+  for (const [k] of jobs) if (!k.startsWith("A:")) res[k] = lists[k].filter((s) => aSigs.has(s)).length;
+  rr.midLists = lists;
   const own = (await sigList(erUrl(r.A), desks[A])).filter((s) => aSigs.has(s)).length;
   const listed = Object.values(res).reduce((a, b) => a + b, 0);
-  R.add("L5", listed === 0 ? "PASS" : DEV ? "FAIL" : "LOCAL-EXPECTED", `round ${rr.n} mid-round: A's acts (${aSigs.size} sent) in signature lists of others${DEV ? "" : " (the local stack lists every tx; devnet-tee lists none)"}`, { listedToOthers: res, listedToA: own });
+  R.add("L5", listed === 0 ? "PASS" : DEV ? "FAIL" : "LOCAL-EXPECTED", `round ${rr.n} mid-round: A's acts (${aSigs.size} sent) in signature lists of others${DEV ? " (anon, B, O)" : " (the local stack lists every tx; devnet-tee lists none)"}`, { listedToOthers: res, listedToA: own });
 }
 async function probeL6() {
   const r = ROLES();
@@ -432,7 +547,7 @@ async function probeL6() {
   const out: Record<string, string> = {};
   let ok = true;
   for (const [who, t] of [["anon", r.anon], ["O", r.O], ["A", r.A]] as const) {
-    const b = await rpc(erUrl(t), "getBlock", [slot, { maxSupportedTransactionVersion: 0, transactionDetails: "full" }]);
+    const b = await rpcB(erUrl(t), "getBlock", [slot, { maxSupportedTransactionVersion: 0, transactionDetails: "full" }]);
     const txs = b.body?.result?.transactions;
     ok &&= !txs || txs.length === 0;
     out[who] = `HTTP ${b.http} ${txs ? `${txs.length} txs` : JSON.stringify(b.body?.error ?? b.body?.raw ?? b.body).slice(0, 60)}`;
@@ -449,7 +564,7 @@ async function probeL7(rr: RoundRun) {
   await pool(cases, 6, async ([k, l]) => {
     const tx = new Transaction({ feePayer: kp.publicKey, recentBlockhash: blockhash }).add(actIx(kp.publicKey, desks[B], k, l, seqOf[B] + 1000));
     tx.sign(kp);
-    const r = await rpc(erUrl(t), "simulateTransaction", [tx.serialize().toString("base64"), { encoding: "base64", sigVerify: false, replaceRecentBlockhash: true, commitment: "confirmed",
+    const r = await rpcB(erUrl(t), "simulateTransaction", [tx.serialize().toString("base64"), { encoding: "base64", sigVerify: false, replaceRecentBlockhash: true, commitment: "confirmed",
       accounts: { encoding: "base64", addresses: [book.toBase58(), desks[A].toBase58()] } }]);
     const v = r.body?.result?.value;
     const accs = v?.accounts ?? null;
@@ -467,35 +582,42 @@ async function joinTry(kp: Keypair, seat: number): Promise<string> {
   return r.ok ? "ok" : errName(r.err);
 }
 const l12: Record<number, Record<string, string>> = {};
+const l12late: number[] = [];
+/** The three live-phase joins; a try is judged only if the round was still LIVE before and after it. */
 async function probeL12live(rr: RoundRun) {
-  l12[rr.n] = {
-    seat8: await joinTry(Keypair.generate(), 8),
-    humanSeat0: await joinTry(Keypair.generate(), A),
-    BalreadySeated: await joinTry(players[B], 2),
-  };
+  const live = () => rr.latest?.round === rr.n && rr.latest.phase === PHASE.live;
+  const ok0 = live();
+  const x = { seat8: await joinTry(Keypair.generate(), 8), humanSeat0: await joinTry(Keypair.generate(), A), BalreadySeated: await joinTry(players[B], 2) };
+  if (ok0 && live()) l12[rr.n] = x; else l12late.push(rr.n);
 }
-async function probeL12bell(rr: RoundRun) { l12[rr.n].bellPhase = await joinTry(Keypair.generate(), 3); }
+async function probeL12bell(rr: RoundRun) { if (l12[rr.n]) l12[rr.n].bellPhase = await joinTry(Keypair.generate(), 3); }
 
 // ------------------------------------------------------------------ websocket observers (one set per round)
-function observers(rr: RoundRun) {
+function observers() {
   const r = ROLES();
   const acct = (label: string, t: string | undefined, acc: PublicKey) => new Sub(label, wsUrl(t), "accountSubscribe", [acc.toBase58(), { encoding: "base64", commitment: "confirmed" }]);
   const logs = (label: string, t: string | undefined, filter: unknown) => new Sub(label, wsUrl(t), "logsSubscribe", [filter, { commitment: "confirmed" }]);
   return {
     own: acct("B:deskB", r.B, desks[B]),
+    tableAnon: acct("anon:table", r.anon, table), // public: times the reveal as the same websocket server sees it
     nonMember: [acct("anon:deskA", r.anon, desks[A]), acct("anon:book", r.anon, book), acct("O:deskA", r.O, desks[A]), acct("O:book", r.O, book), acct("B:deskA", r.B, desks[A]), acct("B:book", r.B, book)],
     logs: [logs("anon:program", r.anon, { mentions: [PROGRAM_ID.toBase58()] }), logs("anon:table", r.anon, { mentions: [table.toBase58()] }), logs("anon:book", r.anon, { mentions: [book.toBase58()] }),
-      logs("O:program", r.O, { mentions: [PROGRAM_ID.toBase58()] }), logs("O:book", r.O, { mentions: [book.toBase58()] })],
+      logs("O:program", r.O, { mentions: [PROGRAM_ID.toBase58()] }), logs("O:table", r.O, { mentions: [table.toBase58()] }), logs("O:book", r.O, { mentions: [book.toBase58()] }),
+      logs("B:program", r.B, { mentions: [PROGRAM_ID.toBase58()] })],
     all: [logs("anon:all", r.anon, "all"), logs("O:all", r.O, "all")],
   };
 }
 type Obs = ReturnType<typeof observers>;
-function closeObs(o: Obs) { for (const s of [o.own, ...o.nonMember, ...o.logs, ...o.all]) s.close(); }
+const obsSubs = (o: Obs) => [o.own, o.tableAnon, ...o.nonMember, ...o.logs, ...o.all];
+function closeObs(o: Obs) { for (const s of obsSubs(o)) s.close(); }
+/** Deliveries per log stream over the whole run, split by arrival time against the reveal. */
+const streamTiming: Record<string, { pre: number; during: number; post: number; unknownPre: number; rounds: number }> = {};
 
-function judgeObservers(rr: RoundRun, o: Obs, tOpen: number, tBell: number) {
-  const within = (s: Sub) => s.notes.filter((x) => x.t >= tOpen && x.t <= tBell);
+function judgeObservers(rr: RoundRun, o: Obs) {
+  const tm = rr.times!;
+  const within = (s: Sub) => s.notes.filter((x) => x.t >= tm.open && x.t <= tm.bell);
   // L2: own Desk delivered every beat; B reads its own Desk
-  const beats = new Set<number>(o.own.notes.map((x) => { try { return Buffer.from(x.v.value.data[0], "base64").readUInt16LE(84); } catch { return -1; } }));
+  const beats = new Set<number>(o.own.notes.filter((x) => x.t <= tm.bell + 1500).map((x) => { try { return Buffer.from(x.v.value.data[0], "base64").readUInt16LE(84); } catch { return -1; } }));
   const bell = rr.final?.beat ?? 0;
   const firstSeen = Math.min(...[...beats].filter((b) => b >= 0));
   const missing: number[] = [];
@@ -504,32 +626,68 @@ function judgeObservers(rr: RoundRun, o: Obs, tOpen: number, tBell: number) {
     `round ${rr.n}: B's own Desk by read and accountSubscribe(token)`, { notifications: o.own.notes.length, beatsDelivered: beats.size, firstBeat: firstSeen, bell, missingBeats: missing, error: o.own.error });
   const nm = Object.fromEntries(o.nonMember.map((s) => [s.label, { ...s.summary(), inRound: within(s).length }]));
   R.check("L2.nonmember", o.nonMember.every((s) => within(s).length === 0), `round ${rr.n}: accountSubscribe(Desk A / Book) as anon, O, B between open and bell`, nm);
-  // log streams: private acts or ticks delivered to non-members between open and bell
-  const actSigs = new Set(sent.filter((x) => x.round === rr.n).map((x) => x.sig));
-  const classify = (s: Sub) => {
-    const xs = within(s);
-    const acts = xs.filter((x) => actSigs.has(x.v?.value?.signature)).length;
-    const ticks = xs.filter((x) => (x.v?.value?.logs ?? []).includes(CRANK_LINE) && (x.v?.value?.logs ?? []).some((l: string) => l.includes(PROGRAM_ID.toBase58()))).length;
-    return { ...s.summary(), acts, ticks };
+  // log streams: every delivery of one of this round's private txs (acts sent while sealed, ticks, VRF callback,
+  // open_round, join), timed by local arrival against the reveal tx: before it was sent, while in flight, after
+  // the websocket server itself announced the REVEALED Table
+  const priv = new Map<string, string>();
+  for (const x of sent) if (x.round === rr.n && x.phase !== PHASE.revealed) priv.set(x.sig, "act");
+  for (const t of rr.ticks ?? []) priv.set(t.sig, "tick");
+  if (rr.vrfSig) priv.set(rr.vrfSig, "vrf");
+  priv.set(rr.openSig, "open_round");
+  if (rr.joinSig) priv.set(rr.joinSig, "join");
+  const revealAt = Math.min(tm.revealSeen || Infinity, tm.revealConfirmed);
+  const ticksCu = new Set((rr.ticks ?? []).map((t) => t.pcu));
+  const actCu = new Set(sent.filter((x) => x.round === rr.n && x.found).map((x) => x.pcu));
+  let preTickVrf = 0;
+  const classify = (s: Sub, all: boolean) => {
+    const xs = s.notes.filter((x) => x.t >= tm.open);
+    const out: any = { ...s.summary(), pre: 0, during: 0, post: 0, unknownPre: 0, preByKind: {} as Record<string, number> };
+    const preCu: number[] = [], preLogLines: number[] = [], preCtx: number[] = [];
+    let firstPost = Infinity;
+    const anomalies: string[] = [];
+    for (const x of xs) {
+      const sig = x.v?.value?.signature, kind = priv.get(sig);
+      if (!kind) { if (!all && x.t < tm.revealSent) { out.unknownPre++; (out.unknownPreSigs ??= []).length < 3 && out.unknownPreSigs.push(sig); } continue; }
+      if (x.t < tm.revealSent) {
+        out.pre++; out.preByKind[kind] = (out.preByKind[kind] ?? 0) + 1;
+        const logs: string[] = x.v?.value?.logs ?? [];
+        const cu = progCu(logs), ll = programLogLines(logs);
+        preCu.push(cu); preLogLines.push(ll); preCtx.push(x.v?.context?.slot ?? 0);
+        if (kind === "tick" || kind === "vrf") preTickVrf++;
+        if (ll > 0) anomalies.push(`${kind} ${sig.slice(0, 8)} has ${ll} program log lines`);
+        if (kind === "act" && logs.length && !actCu.has(cu)) anomalies.push(`act ${sig.slice(0, 8)} CU ${cu}`);
+        if (kind === "tick" && logs.length && !ticksCu.has(cu)) anomalies.push(`tick ${sig.slice(0, 8)} CU ${cu}`);
+      } else if (x.t < revealAt) out.during++;
+      else { out.post++; firstPost = Math.min(firstPost, x.t); }
+    }
+    if (out.pre) { out.preCu = hist(preCu); out.preWithLogs = preCu.filter((c) => c >= 0).length; out.preCtxSlots = [Math.min(...preCtx), Math.max(...preCtx)]; }
+    if (firstPost < Infinity) out.firstPostMsAfterReveal = firstPost - revealAt;
+    out.anomalies = anomalies.slice(0, 5); out.nAnomalies = anomalies.length;
+    const agg = (streamTiming[s.label] ??= { pre: 0, during: 0, post: 0, unknownPre: 0, rounds: 0 });
+    agg.pre += out.pre; agg.during += out.during; agg.post += out.post; agg.unknownPre += out.unknownPre; agg.rounds++;
+    if (!out.preByKind || !Object.keys(out.preByKind).length) delete out.preByKind;
+    return out;
   };
-  const lv = Object.fromEntries(o.logs.map((s) => [s.label, classify(s)]));
+  const timing = { openSlot: rr.open.openSlot, bellSlot: rr.final?.bellSlot, revealSlot: rr.final?.revealSlot, revealTxMs: tm.revealConfirmed - tm.revealSent, revealSeenMsAfterSent: tm.revealSeen ? tm.revealSeen - tm.revealSent : null };
+  const lv = Object.fromEntries(o.logs.map((s) => [s.label, classify(s, false)]));
   const anySub = o.logs.some((s) => s.subscribed);
-  const leaked = Object.values(lv).reduce((a: number, v: any) => a + v.acts + v.ticks, 0);
+  const preLogs = Object.values(lv).reduce((a: number, v: any) => a + v.pre, 0);
   if (!anySub && !DEV) R.add("L5.logs", "LOCAL-EXPECTED", `round ${rr.n}: logsSubscribe(program / Table / Book) as anon and O (the local stack refuses logsSubscribe; devnet: delivers nothing private)`, lv);
-  else R.check("L5.logs", leaked === 0, `round ${rr.n}: logsSubscribe(program / Table / Book) as anon and O, private acts/ticks delivered between open and bell`, lv);
-  const av = Object.fromEntries(o.all.map((s) => [s.label, classify(s)]));
+  else R.check("L5.logs", preLogs === 0 && o.logs.every((s) => s.subscribed), `round ${rr.n}: logsSubscribe(program / Table / Book) as anon, O, B: deliveries of the round's private txs before the reveal (must be 0) / during the reveal tx / after`, { ...lv, timing });
+  const av = Object.fromEntries(o.all.map((s) => [s.label, classify(s, true)]));
   const allSub = o.all.some((s) => s.subscribed);
-  const sampled = Object.values(av).reduce((a: number, v: any) => a + v.acts + v.ticks, 0);
+  const preAll = Object.values(av).reduce((a: number, v: any) => a + v.pre, 0);
+  const bad = Object.values(av).reduce((a: number, v: any) => a + v.nAnomalies, 0);
   if (!allSub && !DEV) R.add("L19.live", "LOCAL-EXPECTED", `round ${rr.n}: logsSubscribe("all") live sample (refused by the local stack; on devnet-tee it samples acts and ticks with logs and CU)`, av);
-  else R.add("L19.live", "INFO", `round ${rr.n}: logsSubscribe("all") sample of private txs (expected on devnet-tee; harmless only because act/tick log nothing and burn constant CU, see L19)`, { ...av, sampled });
-  return { allNotes: o.all.flatMap((s) => within(s)) };
+  else R.add("L19.live", bad ? "FAIL" : "INFO", `round ${rr.n}: logsSubscribe("all") as anon and O: ${preAll} of the round's private txs delivered before the reveal${preAll ? " (each must carry the class CU and no log line)" : ""}`, { ...av, refActCu: [...actCu], refTickCu: [...ticksCu] });
+  rr.preRevealTickVrf = preTickVrf;
 }
 
 // ------------------------------------------------------------------ after the bell
-async function collectCu(rr: RoundRun) {
+async function collectCu(rr: RoundRun, obs?: Obs) {
   const mine = sent.filter((x) => x.round === rr.n && !x.found);
-  await pool(mine, 24, async (x) => {
-    const b = await getTx(cuUrl(), x.sig, 3);
+  await pool(mine, DEV ? 12 : 24, async (x) => {
+    const b = await getTx(cuUrl(), x.sig, DEV ? 6 : 3);
     const r = b?.result;
     if (!r) return;
     x.found = true;
@@ -549,20 +707,37 @@ async function collectCu(rr: RoundRun) {
   const sigs: string[] = [];
   let before: string | undefined;
   for (let page = 0; page < 20; page++) {
-    const r = await rpc(cuUrl(), "getSignaturesForAddress", [table.toBase58(), { limit: 1000, before, commitment: "confirmed" }]);
+    const r = await rpcB(cuUrl(), "getSignaturesForAddress", [table.toBase58(), { limit: 1000, before, commitment: "confirmed" }]);
     const xs: any[] = r.body?.result ?? [];
     if (!xs.length) break;
     for (const x of xs) if (x.slot >= lo && x.slot <= hi) sigs.push(x.signature);
     before = xs[xs.length - 1].signature;
     if (xs[xs.length - 1].slot < lo) break;
   }
+  // devnet: also every tx of our program a log stream delivered for this round (the Table's list has missed a
+  // whole round's ticks once, right after a pool was created); kept only if it touches this Table
+  const listed = new Set(sigs);
+  let fromStreams = 0;
+  if (obs && !CFG.raw) {
+    const actSigs = new Set(sent.map((x) => x.sig));
+    for (const x of [...obs.logs, ...obs.all].flatMap((o) => o.notes)) {
+      const sig = x.v?.value?.signature, logs: string[] = x.v?.value?.logs ?? [];
+      if (sig && !listed.has(sig) && !actSigs.has(sig) && logs.some((l) => l.startsWith(`Program ${PROGRAM_ID.toBase58()} invoke`))) { listed.add(sig); sigs.push(sig); fromStreams++; }
+    }
+  }
   const ticks: any[] = [];
-  await pool(sigs, 24, async (s) => {
-    const b = await getTx(cuUrl(), s, 3);
+  const vrf: string[] = [];
+  await pool(sigs, DEV ? 12 : 24, async (s) => {
+    const b = await getTx(cuUrl(), s, DEV ? 6 : 3);
     const r = b?.result;
     const logs: string[] = r?.meta?.logMessages ?? [];
     const msg = r?.transaction?.message;
     const keys: string[] = msg?.accountKeys ?? [];
+    if (!keys.includes(table.toBase58())) return;
+    if (r.slot < lo || r.slot > hi) return;
+    const topVrf = (msg?.instructions ?? []).some((i: any) => keys[i.programIdIndex] === PROGRAM_ID.toBase58() && Buffer.from(bs58.decode(i.data)).subarray(0, 8).equals(VRF_CB_DISC));
+    // the oracle's fulfil tx: the VRF program at the top level calling our vrf_callback (open_round calls the VRF program one level down)
+    if (s !== rr.openSig && (topVrf || logs.includes(`Program ${VRF_PROGRAM} invoke [1]`))) { vrf.push(s); return; }
     const viaCrank = logs.includes(CRANK_LINE);
     const direct = (msg?.instructions ?? []).some((i: any) => keys[i.programIdIndex] === PROGRAM_ID.toBase58() && Buffer.from(bs58.decode(i.data)).subarray(0, 8).equals(TICK_DISC));
     if (!viaCrank && !direct) return;
@@ -571,12 +746,14 @@ async function collectCu(rr: RoundRun) {
   });
   ticks.sort((a, b) => a.slot - b.slot);
   rr.ticks = ticks;
+  rr.vrfSig = vrf[0];
+  (rr as any).tickSources = { tableList: sigs.length - fromStreams, extraFromStreams: fromStreams, ticks: ticks.length, vrf: vrf.length };
 }
 const roundData: { n: number; record?: Buffer; seed?: Buffer; ok: boolean }[] = [];
 async function probeL14(rr: RoundRun) {
   const anonBook = await readAccount(CFG.er, book);
   const anonDesks = await Promise.all(desks.map((d) => readAccount(CFG.er, d)));
-  const round = await readAccount(CFG.er, pda.round(T, rr.n));
+  const round = await readAccount(DEV ? CFG.base : CFG.er, pda.round(T, rr.n)); // devnet: committed to the base layer
   const corePath = new URL("../app/src/core/index.ts", import.meta.url).href;
   const core: any = await import(corePath);
   const ev: any = { bookPublic: !!anonBook.data, desksPublic: anonDesks.filter((a) => a.data).length };
@@ -614,8 +791,9 @@ async function probeL20after(rr: RoundRun) {
   for (const [cls, s] of Object.entries(sigs)) { const sh = txShape(await getTx(CFG.er, s, 3)); view[cls] = `${sh.kind} k${sh.keys} i${sh.ixs}`; if (sh.kind === "full") full++; }
   const aSigs = new Set(sent.filter((x) => x.round === rr.n && x.desk === A && x.who === "player").map((x) => x.sig));
   const listed = (await sigList(CFG.er, desks[A])).filter((s) => aSigs.has(s)).length;
+  const listedBurner = DEV ? (await sigList(CFG.er, players[A].publicKey)).filter((s) => aSigs.has(s)).length : undefined;
   l20[rr.n] = { sigs, before: { view, full, listed } };
-  R.check("L20.reveal", full === Object.keys(sigs).length && full > 0, `round ${rr.n} after the bell: anon reads A's acts (public replay, by design)`, { view, deskAListedToAnon: listed });
+  R.check("L20.reveal", full === Object.keys(sigs).length && full > 0 && (!DEV || listed > 0), `round ${rr.n} after the bell: anon reads and lists A's acts (public replay, by design)`, { view, deskAListedToAnon: listed, burnerListedToAnon: listedBurner, of: aSigs.size });
 }
 async function probeL20resealed(n: number) {
   const rec = l20[n];
@@ -633,56 +811,66 @@ async function probeL20resealed(n: number) {
   const aSigs = new Set(sent.filter((x) => x.round === n && x.desk === A && x.who === "player").map((x) => x.sig));
   const listedDesk = (await sigList(CFG.er, desks[A])).filter((s) => aSigs.has(s)).length;
   const listedBurner = (await sigList(CFG.er, players[A].publicKey)).filter((s) => aSigs.has(s)).length;
-  const listedAnon = listedDesk + listedBurner;
+  const listedProgram = DEV ? (await sigList(CFG.er, PROGRAM_ID)).filter((s) => aSigs.has(s)).length : 0;
+  const listedB = DEV ? (await sigList(erUrl(r.B), desks[A])).filter((s) => aSigs.has(s)).length : 0;
+  const listedAnon = listedDesk + listedBurner + listedProgram + listedB;
   R.check("L20", allRedacted, `round ${n} after the re-seal for round ${n + 1}: getTransaction of its acts as anon and B redacted again`, view);
-  R.add("L20.list", listedAnon === 0 ? "PASS" : DEV ? "FAIL" : "LOCAL-EXPECTED", `round ${n} after the re-seal: A's acts in the signature lists of Desk A and A's burner, as anon${DEV ? "" : " (the local stack lists every tx)"}`, { deskA: listedDesk, burner: listedBurner, of: aSigs.size });
+  R.add("L20.list", listedAnon === 0 ? "PASS" : DEV ? "FAIL" : "LOCAL-EXPECTED", `round ${n} after the re-seal: A's acts in the signature lists of Desk A and A's burner${DEV ? ", program id (anon) and Desk A as B" : ", as anon (the local stack lists every tx)"}`, { deskA: listedDesk, burner: listedBurner, ...(DEV ? { program: listedProgram, deskAasB: listedB } : {}), of: aSigs.size });
 }
 
 // ------------------------------------------------------------------ one round
-async function runRound(n: number, vrfQueue: PublicKey, bettors: Keypair[]): Promise<RoundRun> {
-  R.log(`round ${n}: ${["crowd (every desk on level 7, pings 7)", "spread (desk s on level 3s+1; A stays on level 1)", "silent + fuzz (no placement, random kinds/levels, stale seqs)"][(n - 1) % 3]}`);
+async function runRound(i: number, n: number, vrfQueue: PublicKey, bettors: Keypair[], prev: RoundRun | null): Promise<RoundRun> {
+  R.log(`round ${n}${n !== i ? ` (${i} of this run)` : ""}: ${["crowd (every desk on level 7, pings 7)", "spread (desk s on level 3s+1; A stays on level 1)", "silent + fuzz (no placement, random kinds/levels, stale seqs)"][(i - 1) % 3]}`);
   const roundAcc = pda.round(T, n), tape = pda.tape(T, n);
   const planned = Math.floor(Date.now() / 1000) - 2;
-  must(await send(base, [
+  must(await baseSend([
     await ix(progBase.methods.createRecord(new BN(T), new BN(n), new BN(planned)).accountsPartial({ house: house.publicKey, config: pda.config(), ledger: pda.ledger(T), round: roundAcc, tape })),
     await ix(progBase.methods.delegate(KIND.round, new BN(T), new BN(n)).accountsPartial({ house: house.publicKey, config: pda.config(), pda: roundAcc, validator: CFG.validator })),
-  ], [house]), `create_record ${n}`);
-  if (n === 1) {
+  ], [house], `create_record ${n}`), `create_record ${n}`);
+  const callers: Keypair[] = [];
+  if (i === 1) {
     const call = (kp: Keypair) => ix(programOn(base, kp).methods.placeCall(3).accountsPartial({ bettor: kp.publicKey, config: pda.config(), tape, call: callPda(tape, kp.publicKey) }));
-    const c1 = await send(base, [await call(bettors[0])], [bettors[0]]);
-    const c2 = await send(base, [await call(bettors[0])], [bettors[0]]);
+    const c1 = await baseSend([await call(bettors[0])], [bettors[0]], "place_call");
+    if (c1.ok) callers.push(bettors[0]);
+    // a second call from the same burner must be refused (devnet: refused at preflight, so it never lands)
+    const c2 = await baseSend([await call(bettors[0])], [bettors[0]], "place_call again (expected refusal)");
     (l16 as any).first = c1.ok ? "ok" : errName(c1.err); (l16 as any).second = c2.ok ? "ok" : errName(c2.err) + " " + ((c2.logs ?? []).find((l) => /already in use|Error/.test(l)) ?? "").slice(0, 80);
   }
   if (!(await waitFor(async () => { const a = await readAccount(erUrl(tH), roundAcc); return a.data && a.owner === PROGRAM_ID.toBase58(); }, 20_000))) throw new Error(`Round ${n} not visible on the rollup`);
-  if (n > 1) { await reseal(); await probeL20resealed(n - 1); }
+  if (prev) { await reseal(); await probeL20resealed(prev.n); }
+  else { const t = await readTable(); if (t && t.v.sealed !== 0x1ff) await reseal(); }
 
   // L21: a stranger schedules every task id computable from public data before open_round
   const squat = [predictableTaskId(T, n), predictableTaskId(T, n) + 1n, predictableTaskId(T, n) - 1n, predictableTaskId(T, n + 1), predictableTaskId(T, n - 1)].map((x) => x & 0x7fffffffffffffffn);
   const sT = await token(stranger);
   const squatOk = await Promise.all(squat.map(async (id) => (await send(erConn(sT), [squatIx(id)], [stranger], { timeoutMs: 8000 })).ok));
 
+  // the observers subscribe before open_round, so every delivery from the first private tx on is seen and timed
+  const obs = observers();
+  await waitFor(async () => obsSubs(obs).every((x) => x.subscribed || x.error), 10_000);
   const openIx = await ix(progEr.methods.openRound(new BN(n)).accountsPartial({ house: house.publicKey, table, book, desk0: desks[0], desk1: desks[1], desk2: desks[2], desk3: desks[3], desk4: desks[4], desk5: desks[5], desk6: desks[6], desk7: desks[7], round: roundAcc, oracleQueue: vrfQueue }));
-  const open = must(await send(erH, [openIx], [house], { cu: 1_000_000 }), `open_round ${n}`);
-  const t0 = (await readTable())!.v;
-  const rr: RoundRun = { n, openSig: open.sig, open: t0, snaps: [], latest: t0, deskSeen: players.map(() => new Set<number>()), deskLatest: players.map(() => null), stop: false, squat, squatOk, lagMax: 0 };
   const tOpen = Date.now();
-  const obs = observers(rr);
+  const open = must(await erSend([openIx], DEV ? 1_400_000 : 1_000_000), `open_round ${n}`);
+  const t0 = (await readTable())!.v;
+  const rr: RoundRun = { n, i, openSig: open.sig, open: t0, snaps: [], latest: t0, deskSeen: players.map(() => new Set<number>()), deskLatest: players.map(() => null), stop: false, squat, squatOk, lagMax: 0 };
   const loops = [monitor(rr), deskWatch(rr), strangerLoop(rr), ...players.map((_, s) => playerLoop(rr, s))];
-  if (n === 1) { // A takes the empty seat 0 with `join` in HIDE, then plays
+  if (i === 1) { // A takes seat 0 with `join` in HIDE, then plays
     const t = await token(players[A]);
-    const j = await send(erConn(t), [await joinIx(players[A], A)], [players[A]], { timeoutMs: 10_000 });
+    const j = await send(erConn(t), [await joinIx(players[A], A)], [players[A]], DEV ? { timeoutMs: 10_000, skipPreflight: false } : { timeoutMs: 10_000 });
     if (!j.ok) throw new Error(`A's join failed: ${errName(j.err)}`);
     rr.joinSig = j.sig;
   }
   // mid-round probes, from live beat 4
   await waitFor(async () => rr.latest?.phase === PHASE.live && rr.latest.beat >= 4, 30_000);
   await probeL1(rr);
+  if (DEV) await probeL12live(rr); // early: the remaining mid-round probes can outlast a short round at devnet latency
   await probeL3(rr);
-  await probeL4(rr, obs);
+  await probeL4mid(rr, obs, prev);
   await probeL5list(rr);
-  if (n === 1) { await probeL6(); await probeHousePool(); }
-  if (n === 2) await probeL7(rr);
-  if (n >= 2) await probeL12live(rr);
+  if (i === 1) await probeL6();
+  if (!houseProbed) await probeHousePool();
+  if (i === 2) await probeL7(rr);
+  if (i >= 2 && !DEV) await probeL12live(rr);
   if (rr.latest?.phase !== PHASE.live) R.log(`warn   round ${n}: mid-round probes ran past the live phase (phase ${rr.latest?.phase})`);
   // the bell
   const atBell = await waitFor(async () => (rr.latest?.phase === PHASE.bell ? rr.latest : null), 90_000, 50);
@@ -691,38 +879,69 @@ async function runRound(n: number, vrfQueue: PublicKey, bettors: Keypair[]): Pro
   rr.stop = true;
   await Promise.all(loops);
   // fuzz in BELL (sealed): every player sends two acts
-  for (let s = 0; s < NDESK; s++) for (let i = 0; i < 2; i++)
+  for (let s = 0; s < NDESK; s++) for (let k = 0; k < 2; k++)
     sendAct(players[s], await token(players[s]), { round: n, desk: s, who: "player", cls: "fuzz-bell", kind: rnd(256), level: rnd(256), seq: ++seqOf[s], phase: PHASE.bell }, desks[s]);
-  if (n >= 2) await probeL12bell(rr);
+  if (i >= 2 || DEV) await probeL12bell(rr);
   await sleep(1500);
-  closeObs(obs);
+  if (!DEV) closeObs(obs);
   rr.final = (await readTable())!.v;
   const ticksBefore = rr.final.tickCalls;
-  must(await send(erH, [await ix(progEr.methods.reveal().accountsPartial({ caller: house.publicKey, table, book, round: roundAcc }))], [house], { cu: 400_000 }), `reveal ${n}`);
+  const tRevealSent = Date.now();
+  must(await erSend([await ix(progEr.methods.reveal().accountsPartial({ caller: house.publicKey, table, book, round: roundAcc }))], 400_000), `reveal ${n}`);
+  const tRevealConfirmed = Date.now();
+  // devnet: commit the Round to the base layer right after the reveal (it settles and closes there)
+  if (DEV) must(await erSend([await ix(progEr.methods.commitRound(new BN(n)).accountsPartial({ house: house.publicKey, table, round: roundAcc, magicFeeVault: magicFeeVaultPdaFromValidator(CFG.validator) }))], 400_000), `commit_round ${n}`);
   await unseal();
   rr.final = (await readTable())!.v;
   await sleep(1500);
   const afterCancel = (await readTable())!.v.tickCalls;
   (rr as any).ticksAfterCancel = afterCancel - rr.final.tickCalls;
   (rr as any).ticksBell = rr.final.tickCalls - ticksBefore;
-  judgeObservers(rr, obs, tOpen, tBell);
-  if (n === 1) { // fuzz in REVEALED (public): acts never fail
+  if (DEV) {
+    const onBase = await waitFor(async () => { const a = await readAccount(CFG.base, roundAcc); return a.data && a.owner === PROGRAM_ID.toBase58() && a.data[144] === 2; }, 60_000, 250);
+    if (!onBase) throw new Error(`Round ${n} not committed to the base layer within 60 s`);
+    // keep the log streams open after the reveal, so a post-reveal replay is seen and timed as well
+    while (Date.now() - tRevealConfirmed < 10_000) await sleep(250);
+    closeObs(obs);
+  }
+  const revealSeen = obs.tableAnon.notes.find((x) => { try { const b = Buffer.from(x.v.value.data[0], "base64"); return b[1069] === PHASE.revealed && Number(b.readBigUInt64LE(16)) === n; } catch { return false; } })?.t ?? 0;
+  rr.times = { open: tOpen, bell: tBell, revealSent: tRevealSent, revealConfirmed: tRevealConfirmed, revealSeen };
+  if (i === 1) { // fuzz in REVEALED (public): acts never fail
     for (let s = 0; s < NDESK; s++)
       sendAct(players[s], await token(players[s]), { round: n, desk: s, who: "player", cls: "fuzz-revealed", kind: rnd(256), level: rnd(256), seq: ++seqOf[s], phase: PHASE.revealed }, desks[s]);
     await sleep(1000);
   }
-  await collectCu(rr);
+  await collectCu(rr, obs);
+  judgeObservers(rr, obs);
+  probeL4post(rr);
   await probeL14(rr);
   await probeL20after(rr);
-  if (n === 1) {
+  if (i === 1) {
     const tp = await readAccount(CFG.base, tape);
     const close = tp.data ? Number(tp.data.readBigInt64LE(24)) : 0;
     while (Date.now() / 1000 < close + 2) await sleep(500);
-    const late = await send(base, [await ix(programOn(base, bettors[1]).methods.placeCall(3).accountsPartial({ bettor: bettors[1].publicKey, config: pda.config(), tape, call: callPda(tape, bettors[1].publicKey) }))], [bettors[1]]);
+    const late = await baseSend([await ix(programOn(base, bettors[1]).methods.placeCall(3).accountsPartial({ bettor: bettors[1].publicKey, config: pda.config(), tape, call: callPda(tape, bettors[1].publicKey) }))], [bettors[1]], "place_call after close (expected refusal)");
     (l16 as any).afterClose = late.ok ? "ok" : errName(late.err);
   }
-  R.log(`round ${n}: bell after live beat ${rr.final.beat}, resolves ${rr.final.resolves}, tick calls ${rr.final.tickCalls}, acts sent ${sent.filter((x) => x.round === n).length}, ticks read ${rr.ticks?.length}`);
+  if (DEV) await settleAndClose(n, callers);
+  R.log(`round ${n}: bell after live beat ${rr.final.beat}, resolves ${rr.final.resolves}, tick calls ${rr.final.tickCalls}, acts sent ${sent.filter((x) => x.round === n).length}, ticks read ${rr.ticks?.length} ${JSON.stringify((rr as any).tickSources)}, vrf callback ${rr.vrfSig ? "found" : "not found"}`);
   return rr;
+}
+/** Devnet: settle the Tape (claims paid in the same tx), close Round + Tape, so nothing is left open. */
+const closed: { round: number; roundGone: boolean; tapeGone: boolean; claims: number; tape: any }[] = [];
+async function settleAndClose(n: number, callers: Keypair[]) {
+  const round = pda.round(T, n), tape = pda.tape(T, n);
+  const settle = await ix(progBase.methods.settleRound().accountsPartial({ caller: house.publicKey, round, tape }));
+  const claim = (b: Keypair) => ix(progBase.methods.claimCall().accountsPartial({ caller: house.publicKey, tape, call: callPda(tape, b.publicKey), bettor: b.publicKey }));
+  if (!callers.length) must(await baseSend([settle], [house], `settle_round ${n}`), `settle_round ${n}`);
+  for (let k = 0; k < callers.length; k++) must(await baseSend(k === 0 ? [settle, await claim(callers[k])] : [await claim(callers[k])], [house], `settle + claim ${n}`), `settle + claim ${n}`);
+  const tp = (await readAccount(CFG.base, tape)).data;
+  const tv = tp ? decodeTape(tp) : null;
+  must(await baseSend([await ix(progBase.methods.closeRound().accountsPartial({ house: house.publicKey, config: pda.config(), round, tape }))], [house], `close_round ${n}`), `close_round ${n}`);
+  const c = { round: n, roundGone: !(await readAccount(CFG.base, round)).data, tapeGone: !(await readAccount(CFG.base, tape)).data, claims: callers.length,
+    tape: tv ? { total: tv.total.toString(), paid: tv.paid.toString(), openCalls: tv.openCalls, winner: tv.winner, void: tv.void } : null };
+  closed.push(c);
+  R.log(`round ${n}: settled and closed on the base layer ${JSON.stringify(c)}`);
 }
 const l16: Record<string, string> = {};
 
@@ -827,7 +1046,7 @@ function finalChecks(runs: RoundRun[], joinAccounts: string[]) {
   const sameAcross = rounds12.every((x) => JSON.stringify(x) === JSON.stringify(rounds12[0]));
   const exp = { seat8: ["AccountNotInitialized", "AccountOwnedByWrongProgram", "BadSeat", "ConstraintSeeds"], humanSeat0: ["SeatTaken"], BalreadySeated: ["AlreadySeated"], bellPhase: ["BadPhase"] };
   const asExpected = rounds12.every((x) => Object.entries(exp).every(([k, v]) => v.includes(x[k])));
-  R.check("L12", !joinAccounts.includes("book") && sameAcross && asExpected && rounds12.length >= 2, "join errors identical across hidden states and public-only; join takes no Book", { joinAccounts, perRound: l12 });
+  R.check("L12", !joinAccounts.includes("book") && sameAcross && asExpected && rounds12.length >= 2, "join errors identical across hidden states and public-only; join takes no Book", { joinAccounts, perRound: l12, ...(l12late.length ? { skippedRoundsPastLive: l12late } : {}) });
 
   // L13: no bell information in the Table before the bell; the meter uses public rules only
   const leaks: string[] = [];
@@ -897,15 +1116,23 @@ async function main() {
   const bhLoop = blockhashLoop(() => stopBh);
   const { joinAccounts } = staticChecks();
   const consoleTokenHits = await clientChecks();
-  const { vrfQueue } = await setupPool();
+  const sol0 = DEV ? await base.getBalance(house.publicKey, "confirmed") : 0;
+  const { vrfQueue, round0 } = await setupPool();
   const bettors = [Keypair.generate(), Keypair.generate()];
-  must(await send(base, bettors.map((b) => SystemProgram.transfer({ fromPubkey: house.publicKey, toPubkey: b.publicKey, lamports: 30_000_000 })), [house]), "fund bettors");
+  must(await baseSend(bettors.map((b) => SystemProgram.transfer({ fromPubkey: house.publicKey, toPubkey: b.publicKey, lamports: DEV ? 15_000_000 : 30_000_000 })), [house], "fund bettors"), "fund bettors");
   const runs: RoundRun[] = [];
-  for (let n = 1; n <= CFG.rounds; n++) runs.push(await runRound(n, vrfQueue, bettors));
+  for (let i = 1; i <= CFG.rounds; i++) runs.push(await runRound(i, round0 + i, vrfQueue, bettors, runs[i - 2] ?? null));
   await reseal(); // seal again so the last round's history is checked after a re-seal too
-  await probeL20resealed(CFG.rounds);
+  await probeL20resealed(runs[runs.length - 1].n);
+  if (DEV) await probeL4resealed(runs[runs.length - 1], "after the final re-seal");
   stopBh = true;
   await bhLoop;
+  if (DEV) { // bettors back to the house (each pays its own fee and ends at 0)
+    for (const b of bettors) {
+      const x = await base.getBalance(b.publicKey, "confirmed");
+      if (x > 5000) must(await baseSend([SystemProgram.transfer({ fromPubkey: b.publicKey, toPubkey: house.publicKey, lamports: x - 5000 })], [b], "sweep bettor"), "sweep bettor");
+    }
+  }
   finalChecks(runs, joinAccounts);
   // L17: the house runner's RPC log names only its own Desks and the Tables
   if (fs.existsSync(CFG.houseRpcLog)) {
@@ -915,6 +1142,13 @@ async function main() {
   } else R.add("L17", "SKIP", "house runner RPC log", `no log at ${CFG.houseRpcLog}`);
   R.check("L15", R.leakedSecrets() === 0 && consoleTokenHits.length === 0, `auth tokens (${tok.size}) never in this run's output; no console call with a token in app/src`, { tokenHitsInOutput: R.leakedSecrets(), consoleTokenLines: consoleTokenHits });
   R.add("L15.browser", "SKIP", "tokens in URLs shown to the user, explorer links, error reports", "needs the browser e2e run");
+  if (DEV) {
+    R.add("L5.timing", "INFO", "log-stream deliveries of private txs over all rounds, by arrival: before the reveal / during the reveal tx / after", streamTiming);
+    const landed = baseTxs.filter((x) => x.ok), refused = baseTxs.filter((x) => !x.ok);
+    const sol1 = await base.getBalance(house.publicKey, "confirmed");
+    R.add("cost", "INFO", "base layer: house wallet and this run's own txs", { pool: T, rounds: runs.map((r) => r.n), houseBefore: sol0 / 1e9, houseAfter: sol1 / 1e9, ownTxsHouseDeltaSol: baseTxs.reduce((a, x) => a + x.houseDelta, 0) / 1e9,
+      baseTxsLanded: landed.length, refusedAtPreflight: refused.map((x) => x.label), closed, rateLimited429: rateLimited });
+  }
 
   // summary
   const order = (id: string) => { const m = id.match(/^L(\d+)/); return (m ? Number(m[1]) : 99) * 100 + (id.includes(".") ? 1 : 0); };
