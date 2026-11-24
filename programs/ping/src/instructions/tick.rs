@@ -1,14 +1,19 @@
-//! Rollup crank body, every 250 ms. Permissionless and harmless: a no-op unless the public phase
-//! is HIDE or LIVE and `slot >= Table.next_deadline_slot`; then it resolves exactly one deadline
-//! (the HIDE end or one live beat) with the rules engine, in place in the Book, writes every
-//! Desk's result and the public row. Never an error, no logs. Everything after the public gate
-//! is branch-free: the bell-only writes are masks, not ifs.
-//! (Task A2 owns verifying the constant compute of this path.)
+//! Rollup crank body, every 250 ms. Permissionless and harmless: it resolves at most one deadline
+//! per call, and only when the public gate opens:
+//!   phase HIDE or LIVE, `slot >= Table.next_deadline_slot`, and, at the HIDE end with VRF
+//!   enabled, either the VRF output has arrived (`Table.vrf_fulfils > 0`) or the deadline is
+//!   `VRF_WAIT_BEATS` beats overdue (then the engine draws the fallback seed from the HIDE salts
+//!   and the slot, and `Table.fallback_seed` / `Round.fallback_seed` record it).
+//! The gate itself is computed with masks from public fields, so every closed-gate call costs the
+//! same in every phase. Past the gate the rules engine resolves the HIDE end or one live beat in
+//! place in the Book, every Desk gets its result and the public row is rewritten; all of it is
+//! branch-free (the bell-only writes are masks), so every resolving call costs the same whatever
+//! the hidden state. Never an error, no logs.
 use crate::constants::*;
-use crate::utils::SyscallHasher;
-use ping_core::mask::{eq, nz, sel};
 use crate::state::*;
+use crate::utils::SyscallHasher;
 use anchor_lang::prelude::*;
+use ping_core::mask::{eq, lt, nz, sel, sel_bytes};
 
 #[derive(Accounts)]
 pub struct Tick<'info> {
@@ -34,20 +39,33 @@ pub struct Tick<'info> {
     pub desk7: AccountLoader<'info, Desk>,
 }
 
+/// 1 when this call may resolve a deadline (public fields only, no branches).
+fn gate(t: &Table, slot: u64) -> u64 {
+    let ph = t.phase as u64;
+    let active = eq(ph, PH_HIDE as u64) | eq(ph, PH_LIVE as u64);
+    // slots stay far below 2^63, as `lt` requires
+    let due = 1 ^ lt(slot, t.next_deadline_slot);
+    let vrf_on = nz(t.vrf_queue.to_bytes().iter().fold(0u64, |a, x| a | *x as u64));
+    let waited = 1 ^ lt(slot, t.next_deadline_slot.saturating_add(VRF_WAIT_BEATS.saturating_mul(t.beat_slots)));
+    let vrf_wait = eq(ph, PH_HIDE as u64) & vrf_on & eq(t.vrf_fulfils as u64, 0) & (1 ^ waited);
+    active & due & (1 ^ vrf_wait)
+}
+
 pub fn tick(ctx: Context<Tick>) -> Result<()> {
     let slot = Clock::get()?.slot;
     let mut t = ctx.accounts.table.load_mut()?;
     t.tick_calls = t.tick_calls.wrapping_add(1);
-    // public gate: phase and slot only (one unsigned compare for "HIDE or LIVE", so both phases
-    // take the same path)
-    if t.phase.wrapping_sub(PH_HIDE) > PH_LIVE - PH_HIDE || slot < t.next_deadline_slot {
+    if gate(&t, slot) == 0 {
         return Ok(());
     }
     let was_hide = eq(t.phase as u64, PH_HIDE as u64);
     let mut out = ping_core::BeatOut::zeroed();
+    let fallback;
     {
         let mut b = ctx.accounts.book.load_mut()?;
-        ping_core::tick::<SyscallHasher, ping_core::NoSink>(b.state_mut(), t.table_id, t.round, slot, &mut ping_core::NoSink, &mut out);
+        let st = b.state_mut();
+        ping_core::tick::<SyscallHasher, ping_core::NoSink>(st, t.table_id, t.round, slot, &mut ping_core::NoSink, &mut out);
+        fallback = st.fallback as u64;
     }
     let bi = (out.beat as usize) % RESULT_SLOTS;
     let a = &ctx.accounts;
@@ -89,17 +107,17 @@ pub fn tick(ctx: Context<Tick>) -> Result<()> {
     t.chain_head = out.chain;
     t.beat_counts[(out.beat as usize) % BEAT_SLOTS_RING] = [out.pings, out.fills];
     t.top_desk = sel(is_bell, out.top_desk as u64, t.top_desk as u64) as u8;
-    t.commit_hash = if_mask(is_bell, &out.chain, &t.commit_hash);
+    let mut commit = t.commit_hash;
+    sel_bytes(is_bell, &out.chain, &mut commit);
+    t.commit_hash = commit;
     t.bell_slot = sel(is_bell, slot, t.bell_slot);
     t.hide_end_slot = sel(was_hide, slot, t.hide_end_slot);
+    t.fallback_seed = sel(was_hide, fallback, t.fallback_seed as u64) as u8;
     t.phase = out.phase;
     t.resolves = t.resolves.wrapping_add(1);
-    t.next_deadline_slot = t.next_deadline_slot.saturating_add(t.beat_slots);
+    // live beats keep their absolute deadlines (a late beat is caught up, never skipped); the
+    // first live beat is timed from the HIDE end, which may have waited for the VRF output
+    let base = sel(was_hide, slot, t.next_deadline_slot);
+    t.next_deadline_slot = base.wrapping_add(t.beat_slots);
     Ok(())
-}
-
-fn if_mask(m: u64, a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
-    let mut r = *b;
-    ping_core::mask::sel_bytes(m, a, &mut r);
-    r
 }

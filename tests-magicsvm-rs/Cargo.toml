@@ -1,0 +1,32 @@
+[package]
+name = "ping-magicsvm-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "In-process tests of the ping program (target/deploy/ping.so) on MagicSVM: base layer + ephemeral rollup, crank, VRF"
+
+# Its own workspace: MagicSVM needs a newer host toolchain than the program (run with `cargo +stable test`).
+[workspace]
+
+[dev-dependencies]
+magicsvm = "0.3.0"
+ping-core = { path = "../crates/ping-core" }
+serde_json = "1"
+sha2 = "0.10"
+solana-account = "4"
+solana-address = { version = "~2.6.1", features = ["curve25519", "sha2"] }
+solana-clock = "3"
+solana-hash = "~4.5.0"
+solana-instruction = { version = "~3.4.0", features = ["bincode"] }
+solana-keypair = "3.1.2"
+solana-message = "4.2.4"
+solana-signer = "3.0.1"
+solana-transaction = { version = "4.1.5", features = ["verify"] }
+
+[profile.dev.package.ping-core]
+opt-level = 3
+
+# MagicSVM clones both ledgers per transaction; unoptimised it is ~10x slower.
+[profile.dev]
+opt-level = 2
+debug = false

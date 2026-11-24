@@ -1,8 +1,14 @@
-//! Rollup (task A2): start a fresh crank task (same derivation, current slot hash) when Table.beat
-//! stalled >= 3 s in HIDE/LIVE (squatted or dead task). House only. Stub until A2.
+//! Rollup: start a fresh crank task when the round's crank has stalled (squatted, dropped or
+//! dead). House only; phase HIDE or LIVE; the current deadline must be at least `STALL_BEATS`
+//! beats overdue (3 s at 1.5-s beats), so it never races a crank that is only catching up.
+//! The new task id uses the same derivation as `open_round` with the current slot hash, so it is
+//! fresh and not computable in advance; it replaces `Table.task_id` (which `reveal` and
+//! `abort_round` cancel). An old task that is still alive only produces no-op ticks: the
+//! deadline gate resolves each deadline once.
 use crate::constants::*;
 use crate::errors::PingError;
 use crate::state::*;
+use crate::utils::*;
 use anchor_lang::prelude::*;
 use ephemeral_rollups_sdk::consts::MAGIC_PROGRAM_ID;
 
@@ -38,6 +44,38 @@ pub struct RescheduleCrank<'info> {
     pub slot_hashes: UncheckedAccount<'info>,
 }
 
-pub fn reschedule_crank(_ctx: Context<RescheduleCrank>) -> Result<()> {
-    err!(PingError::NotImplemented)
+pub fn reschedule_crank(ctx: Context<RescheduleCrank>) -> Result<()> {
+    let slot = Clock::get()?.slot;
+    let (table_id, round, old, interval, iterations, cu) = {
+        let t = ctx.accounts.table.load()?;
+        require_house(&t.house, &ctx.accounts.house.key())?;
+        require!(t.phase == PH_HIDE || t.phase == PH_LIVE, PingError::BadPhase);
+        let stalled_at = t.next_deadline_slot.saturating_add(STALL_BEATS.saturating_mul(t.beat_slots));
+        require!(slot >= stalled_at, PingError::NotStalled);
+        (t.table_id, t.round, t.task_id, t.crank_interval_ms, t.crank_iterations, t.tick_cu_limit)
+    };
+    let (task, _recent) = task_id(&ctx.accounts.slot_hashes.to_account_info(), table_id, round)?;
+    require!(task != old, PingError::NotStalled);
+    {
+        let mut t = ctx.accounts.table.load_mut()?;
+        t.task_id = task;
+        t.task_slot = slot;
+    }
+    let a = &ctx.accounts;
+    let pool = [
+        a.table.to_account_info(),
+        a.book.to_account_info(),
+        a.desk0.to_account_info(),
+        a.desk1.to_account_info(),
+        a.desk2.to_account_info(),
+        a.desk3.to_account_info(),
+        a.desk4.to_account_info(),
+        a.desk5.to_account_info(),
+        a.desk6.to_account_info(),
+        a.desk7.to_account_info(),
+    ];
+    // the crank CPI wants references that live as long as the account infos themselves
+    let payer: &AccountInfo = Box::leak(Box::new(a.house.to_account_info()));
+    let magic: &AccountInfo = Box::leak(Box::new(a.magic_program.to_account_info()));
+    schedule_tick_crank(payer, magic, &pool, task, interval, iterations, cu)
 }

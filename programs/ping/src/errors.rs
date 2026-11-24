@@ -38,4 +38,18 @@ pub enum PingError {
     Overflow,
     #[msg("not implemented yet")]
     NotImplemented,
+    #[msg("calls are closed for this round")]
+    CallsClosed,
+    #[msg("bad desk index")]
+    BadDesk,
+    #[msg("the tape is not settled yet")]
+    NotSettled,
+    #[msg("the tape cannot be closed yet")]
+    TapeOpen,
+    #[msg("payout exceeds what the tape holds")]
+    Insolvent,
+    #[msg("the crank is not stalled")]
+    NotStalled,
+    #[msg("round record missing")]
+    NoRecord,
 }

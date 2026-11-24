@@ -1,4 +1,8 @@
-//! Base (task A3): close a settled Round and its Tape (rent to the house) once every call is claimed or 24 h after close_unix. House only. Stub until A3.
+//! Base: close a Round record and its Tape, all lamports to the house. House only.
+//! Allowed once the Tape is resolved and every call is claimed, or `TAPE_CLOSE_AFTER_SECS` (24 h)
+//! after `Tape.close_unix`; whatever is still in the Tape then (its rent, the floor remainder of
+//! the payouts, and after the timeout any unclaimed calls) goes to the house. The Ledger keeps
+//! record numbers increasing, so a closed (table, round) can never be created again.
 use crate::constants::*;
 use crate::errors::PingError;
 use crate::state::*;
@@ -16,6 +20,16 @@ pub struct CloseRound<'info> {
     pub tape: AccountLoader<'info, Tape>,
 }
 
-pub fn close_round(_ctx: Context<CloseRound>) -> Result<()> {
-    err!(PingError::NotImplemented)
+pub fn close_round(ctx: Context<CloseRound>) -> Result<()> {
+    require_keys_eq!(ctx.accounts.config.load()?.house, ctx.accounts.house.key(), PingError::NotHouse);
+    {
+        require!(ctx.accounts.round.load()?.status != RS_OPEN, PingError::RoundInPlay);
+        let t = ctx.accounts.tape.load()?;
+        let timeout = t.close_unix.checked_add(TAPE_CLOSE_AFTER_SECS).ok_or(PingError::Overflow)?;
+        let done = t.resolved != 0 && t.open_calls == 0;
+        require!(done || Clock::get()?.unix_timestamp >= timeout, PingError::TapeOpen);
+    }
+    let house = ctx.accounts.house.to_account_info();
+    ctx.accounts.tape.close(house.clone())?;
+    ctx.accounts.round.close(house)
 }

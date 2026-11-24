@@ -5,7 +5,7 @@
 //! is an arithmetic 0/1 mask from [`crate::mask`], and every write happens with the mask choosing
 //! the value. The HIDE-end tick, live beats and the bell beat run the same code; the phase only
 //! chooses which results are kept. Indexing by data is allowed (bounds checks always pass).
-use crate::mask::{eq, lt, min, nz, sel, sel_bytes};
+use crate::mask::{eq, lt, min, nz, op, sel, sel_bytes};
 use crate::sha256::Hasher;
 use crate::state::*;
 
@@ -103,7 +103,7 @@ pub fn compute_algo<H: Hasher>(st: &RoundState, beat: u16, out: &mut [u8; DESKS]
         let mut run = 0u64;
         let mut chosen = 0u64;
         for i in 0..LEVELS {
-            chosen += (i as u64 + 1) * (e[i] & eq(run, k));
+            chosen += (i as u64 + 1) & op(e[i] & eq(run, k)).wrapping_neg();
             run += e[i];
         }
         out[s] = chosen as u8;
@@ -198,7 +198,7 @@ pub fn apply_beat<S: Sink>(
             let hit = ip & (1 ^ eq(v as u64, p as u64)) & eq(st.level[v] as u64, l) & nz(rest);
             let sk = st.streak[p * DESKS + v] as u64;
             let skim = SKIM_STEP * (1 + min(sk, SKIM_STEPS - 1));
-            let amt = min(skim, rest) * hit;
+            let amt = min(skim, rest) & op(hit).wrapping_neg();
             st.resting[v] = (rest - amt) as u16;
             st.picked[p] = (st.picked[p] as u64 + amt) as u16;
             st.streak[p * DESKS + v] = min(sk + hit, 200) as u8;
@@ -213,11 +213,14 @@ pub fn apply_beat<S: Sink>(
     }
 
     // log row
-    let row = (b.wrapping_sub(1) as usize).min(MAX_BEATS - 1) * LOG_ROW;
+    // row b - 1 for live beat b (1..=MAX_BEATS); the HIDE-end call (b = 0, nothing kept) uses
+    // the last row. A modulo, not a clamp: the same instructions for every beat.
+    let row = ((b as usize + MAX_BEATS - 1) % MAX_BEATS) * LOG_ROW;
     let mut pings = 0u64;
     let mut fills = 0u64;
     for s in 0..DESKS {
-        let byte0 = kind[s] | ((acts[s].algo as u64 & 1) << 7);
+        let algo = op(acts[s].algo as u64 & 1);
+        let byte0 = kind[s] | (algo << 7);
         st.log[row + 2 * s] = sel(live, byte0, st.log[row + 2 * s] as u64) as u8;
         st.log[row + 2 * s + 1] = sel(live, lvl[s], st.log[row + 2 * s + 1] as u64) as u8;
         let filled = ip_arr[s] & nz(fill[s]);
@@ -229,10 +232,12 @@ pub fn apply_beat<S: Sink>(
         d.fill_amt = fill[s] as u16;
         d.lost_amt = lost[s] as u16;
         d.level = st.level[s];
-        d.action_kind = (kind[s] * live) as u8;
-        d.action_level = (lvl[s] * live) as u8;
-        d.action_algo = ((acts[s].algo as u64 & 1) * live) as u8;
-        d.result = (ip_arr[s] * (1 + filled)) as u8;
+        let keep = op(live).wrapping_neg();
+        d.action_kind = (kind[s] & keep) as u8;
+        d.action_level = (lvl[s] & keep) as u8;
+        d.action_algo = (algo & live) as u8;
+        // RES_NONE, RES_MISS (pinged) or RES_FILL (pinged and filled): filled implies pinged
+        d.result = op(ip_arr[s] + filled) as u8;
         d.victims = victims[s] as u8;
         d.hits_taken = taken[s] as u8;
     }
@@ -332,7 +337,7 @@ pub fn tick<H: Hasher, S: Sink>(st: &mut RoundState, table_id: u64, round: u64, 
         acts[s] = Action {
             kind: sel(has, pk, PING as u64) as u8,
             level: sel(has, st.pending_level[s] as u64, st.algo_next[s] as u64) as u8,
-            algo: (1 ^ has) as u8,
+            algo: op(1 ^ has) as u8,
         };
         st.pending_kind[s] = sel(active, 0, pk) as u8;
         st.pending_level[s] = sel(active, 0, st.pending_level[s] as u64) as u8;
@@ -342,7 +347,7 @@ pub fn tick<H: Hasher, S: Sink>(st: &mut RoundState, table_id: u64, round: u64, 
     apply_beat(st, &acts, &order, b, is_live, sink, out);
 
     // ---- chain, beat counter, bell
-    let ri = ((b as usize).wrapping_sub(1)).min(MAX_BEATS - 1) * LOG_ROW;
+    let ri = ((b as usize + MAX_BEATS - 1) % MAX_BEATS) * LOG_ROW;
     let next = chain_step::<H>(&st.chain, &st.seed, b, &st.log[ri..ri + LOG_ROW]);
     sel_bytes(is_live, &next, &mut st.chain);
     st.beat = sel(is_live, b as u64, st.beat as u64) as u16;

@@ -94,3 +94,16 @@ pub const ADMINS: [Pubkey; 2] = [
 ];
 pub const COMPUTE_BUDGET_PROGRAM: Pubkey = pubkey!("ComputeBudget111111111111111111111111111111");
 pub const SLOT_HASHES_SYSVAR: Pubkey = pubkey!("SysvarS1otHashes111111111111111111111111111");
+
+// ---- Tape timing (seconds after Tape.close_unix, base-layer clock)
+/// An unsettled Tape becomes void (every call refunded by `claim_call`) this long after the close.
+pub const TAPE_REFUND_AFTER_SECS: i64 = 30 * 60;
+/// `close_round` may close a Tape with unclaimed calls this long after the close.
+pub const TAPE_CLOSE_AFTER_SECS: i64 = 24 * 60 * 60;
+
+// ---- liveness (in beats of Table.beat_slots, so they scale with the network's slot rate)
+/// With VRF enabled, the HIDE end waits this many beats past its deadline for the VRF output
+/// before drawing the fallback seed (2 × 1.5 s = 3 s).
+pub const VRF_WAIT_BEATS: u64 = 2;
+/// `reschedule_crank` is allowed once a deadline is this many beats overdue (3 s).
+pub const STALL_BEATS: u64 = 2;

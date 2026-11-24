@@ -156,3 +156,18 @@ export function diffBytes(a: Buffer, b: Buffer): number {
 }
 
 export { Keypair, PublicKey, Connection };
+
+// ------------------------------------------------------------------ Tape / Call (base layer; offsets: docs/LAYOUT.md)
+export const callPda = (tape: PublicKey, bettor: PublicKey) =>
+  PublicKey.findProgramAddressSync([Buffer.from("call"), tape.toBuffer(), bettor.toBuffer()], PROGRAM_ID)[0];
+export function decodeTape(b: Buffer) {
+  return {
+    tableId: Number(b.readBigUInt64LE(8)), round: Number(b.readBigUInt64LE(16)), closeUnix: Number(b.readBigInt64LE(24)),
+    pool: Array.from({ length: NDESK }, (_, s) => b.readBigUInt64LE(32 + 8 * s)), total: b.readBigUInt64LE(96), paid: b.readBigUInt64LE(104),
+    openCalls: b.readUInt32LE(112), nCalls: b.readUInt32LE(116), winner: b[120], resolved: b[121], void: b[122],
+  };
+}
+export function decodeCall(b: Buffer) {
+  return { amount: b.readBigUInt64LE(8), owed: b.readBigUInt64LE(16), tape: new PublicKey(b.subarray(24, 56)).toBase58(),
+    bettor: new PublicKey(b.subarray(56, 88)).toBase58(), desk: b[88], claimed: b[89] };
+}

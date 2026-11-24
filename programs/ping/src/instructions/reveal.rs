@@ -1,9 +1,10 @@
-//! Rollup, after the bell: end the round. Cancels the crank (CancelCrankCpi with Table.task_id),
-//! marks the round REVEALED, fills the Round record (recorded rounds), and clears Table.sealed so
-//! the next round must re-seal. The Book and Desks are then made public with `unseal`.
-//!
-//! PARTIAL until A2: house only; fills the Round header from the Book (no log, no commit hash,
-//! no Top-Desk tie-break). A2 completes it (and may let anyone send it once the phase is BELL).
+//! Rollup, after the bell: end the round. House only (it cancels the crank, whose authority is
+//! the house). Cancels the crank (CancelCrankCpi with Table.task_id), fills the Round record of a
+//! recorded round (required then): the engine's record bytes (seed, initial levels, bell beat,
+//! action log), commit hash = the chain head, totals, Top Desk and its key, seat kinds, slots,
+//! the fallback-seed flag; marks it REVEALED. The Table gets totals, Top Desk and commit hash,
+//! phase REVEALED, and `sealed` is cleared so the next round must re-seal. The Book and Desks
+//! are then made public with `unseal`. Anyone can check the record with `ping_core::verify`.
 use crate::constants::*;
 use crate::errors::PingError;
 use crate::state::*;
@@ -35,6 +36,7 @@ pub fn reveal<'info>(ctx: Context<'info, Reveal<'info>>) -> Result<()> {
         let t = ctx.accounts.table.load()?;
         require_house(&t.house, &ctx.accounts.caller.key())?;
         require!(t.phase == PH_BELL, PingError::BadPhase);
+        require!(t.recorded == 0 || ctx.accounts.round.is_some(), PingError::NoRecord);
         t.task_id
     };
     cancel_crank(&ctx.accounts.caller, &ctx.accounts.magic_context, &ctx.accounts.magic_program, task)?;

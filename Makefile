@@ -18,9 +18,9 @@ HAS_SPIKE  := $(wildcard spike/Cargo.toml)
 # spike/ is its own Cargo + Anchor workspace (the root workspace excludes it); it shares target/.
 SPIKE_ENV  := CARGO_TARGET_DIR=$(CURDIR)/target
 
-.PHONY: all setup doctor build build-ping build-spike idl keys test app deploy-devnet \
-        balance knowledge local-stack local-fund local-check-a1 spike-local probe-tee clean-ledger \
-        hooks internal-status internal-commit internal-push
+.PHONY: all setup doctor build build-ping build-spike idl keys test test-svm app deploy-devnet \
+        balance knowledge local-stack local-fund local-check-a1 local-check-a3 spike-local probe-tee clean-ledger \
+        hooks internal-status internal-commit internal-push house-local house-stop house-i13
 
 all: build
 
@@ -75,6 +75,12 @@ endif
 	  echo "npx tsc --noEmit -p tsconfig.json"; npx tsc --noEmit -p tsconfig.json; \
 	else echo "test: no TypeScript sources yet; skipping tsc"; fi
 
+# In-process program tests on MagicSVM (base + rollup, crank, VRF) against target/deploy/ping.so:
+# full rounds, constant compute of act/tick, act fuzz, engine vectors, reset, crank, join.
+# Its own Cargo workspace; MagicSVM needs a newer host toolchain than the program.
+test-svm: build-ping
+	cd tests-magicsvm-rs && cargo +stable test -- --nocapture --test-threads 4
+
 app:
 	cd app && npm ci && npm run build
 
@@ -109,6 +115,25 @@ local-fund:
 # re-sealing, one recorded round through the crank, cancel, commit of the Round alone, aborts.
 local-check-a1:
 	npx tsx tests/local/a1-check.ts
+
+# Base-layer money path against the running local stack: settle, calls, claims, refunds, owed, close.
+local-check-a3:
+	npx tsx tests/local/a3-check.ts
+
+# ---- house runner (house/): pools, bots, records. Local: after local-stack + local-fund.
+# Runs in the foreground; settings come from the environment (house/README.md), e.g.
+#   make house-local POOLS=1001 RECORD_EVERY_SEC=120 TEST_CALLS=1
+HOUSE_STATE ?= $(HOME)/.local/state/picked-off
+house-local:
+	CLUSTER=local npx tsx house/src/main.ts
+
+# Stops a runner started in the background, through the pid file the runner writes.
+house-stop:
+	@f=$(HOUSE_STATE)/house-$${CLUSTER:-local}.pid; if [ -f $$f ]; then kill -TERM $$(cat $$f) && echo "stopped $$(cat $$f)"; else echo "no pid file at $$f"; fi
+
+# I13: on the rollup the runner read nothing but each bot's own Desk and the public Table.
+house-i13:
+	npx tsx house/src/i13-check.ts $(HOUSE_STATE)/house-$${CLUSTER:-local}-rpc.jsonl
 
 # ---- spike (local-only prototype, not included in this repository)
 
