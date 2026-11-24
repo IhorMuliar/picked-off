@@ -18,8 +18,8 @@ HAS_SPIKE  := $(wildcard spike/Cargo.toml)
 # spike/ is its own Cargo + Anchor workspace (the root workspace excludes it); it shares target/.
 SPIKE_ENV  := CARGO_TARGET_DIR=$(CURDIR)/target
 
-.PHONY: all setup doctor build build-ping build-spike idl keys test test-svm app deploy-devnet \
-        balance knowledge local-stack local-fund local-check-a1 local-check-a3 spike-local probe-tee clean-ledger \
+.PHONY: all setup doctor build build-ping build-ping-local build-spike idl keys test test-svm app deploy-devnet devnet-version devnet-check-a5 \
+        balance knowledge local-stack local-fund local-check-a1 local-check-a3 leak-probe-local leak-probe-devnet spike-local probe-tee clean-ledger \
         hooks internal-status internal-commit internal-push house-local house-stop house-i13
 
 all: build
@@ -44,8 +44,16 @@ keys:
 	  else echo "keys: no $(PROGRAM_KEYS)/$$n-keypair.json; cargo-build-sbf will generate one"; fi; \
 	done
 
+# The devnet binary: target/deploy/ping.so (default features; deploy-devnet and test-svm use it).
 build-ping: keys
 	$(SBF) --manifest-path programs/ping/Cargo.toml
+
+# The local-stack binary: target/deploy-local/ping.so (feature `local`: also accepts the local test
+# admin, the local validator identity and the VRF test queue). local-stack loads this one.
+build-ping-local: keys
+	@mkdir -p target/deploy-local
+	@[ -f target/deploy-local/ping-keypair.json ] || cp target/deploy/ping-keypair.json target/deploy-local/ 2>/dev/null || true
+	cargo build-sbf --tools-version $(TOOLS) --sbf-out-dir target/deploy-local --manifest-path programs/ping/Cargo.toml --features local
 
 build-spike: keys
 ifneq ($(HAS_SPIKE),)
@@ -63,7 +71,7 @@ ifneq ($(HAS_SPIKE),)
 	  -t $(CURDIR)/target/types/ping_spike.ts
 endif
 
-build: build-ping build-spike idl
+build: build-ping-local build-ping build-spike idl
 
 test:
 	cargo test --workspace
@@ -97,14 +105,29 @@ deploy-devnet: build-ping
 balance:
 	solana balance -k $(WALLET) -u $(DEVNET_RPC)
 
+# Simulates `version` on the TEE until it returns EXPECT_VERSION (an upgrade reaches the TEE minutes
+# after base). Run after every deploy or upgrade, before anything on the rollup.
+devnet-version:
+	npx tsx tests/devnet/version-gate.ts
+
+# Devnet checks (tests/devnet/a5-check.ts): Config, the house pools (table ids 1 and 2), then ROUNDS
+# recorded rounds on POOL with eight scripted desks: privacy, constant compute, round lifecycle, Tape.
+# e.g. make devnet-check-a5 PHASES=rounds ROUNDS=10
+devnet-check-a5:
+	npx tsx tests/devnet/a5-check.ts
+
 # ---- local MagicBlock stack (base :8899, ER :7799, privacy filter :6699). Runs in the foreground;
-# start it in its own terminal after `make build`, then `make local-fund` in another.
+# start it in its own terminal after `make build` (it loads the local binary), then `make local-fund` in another.
+# LOCAL_STACK_ARGS go to the base validator, e.g. LOCAL_STACK_ARGS="--ledger /big/disk/ledger" (its ledger
+# grows by gigabytes per hour).
 LOCAL_RPC    ?= http://127.0.0.1:8899
 LOCAL_WALLET ?= $(HOME)/.config/solana/blitz-ping-localnet.json
 local-stack:
+	@[ -f target/deploy-local/ping.so ] || { echo "local-stack: run make build-ping-local first"; exit 1; }
 	npx mb-stack --reset \
-	  --bpf-program 5eP2A36T97mwaGHf6XoHZU6VoKh1NGxA2QwvtJhAJ6ms target/deploy/ping.so \
-	  $(if $(and $(HAS_SPIKE),$(SPIKE_PROGRAM_ID)),--bpf-program $(SPIKE_PROGRAM_ID) target/deploy/ping_spike.so)
+	  --bpf-program 5eP2A36T97mwaGHf6XoHZU6VoKh1NGxA2QwvtJhAJ6ms target/deploy-local/ping.so \
+	  $(if $(and $(HAS_SPIKE),$(SPIKE_PROGRAM_ID)),--bpf-program $(SPIKE_PROGRAM_ID) target/deploy/ping_spike.so) \
+	  $(LOCAL_STACK_ARGS)
 
 # --reset wipes the ledger: the local wallet starts at 0 SOL and every setup tx fails.
 # Fund it after each start.
@@ -119,6 +142,19 @@ local-check-a1:
 # Base-layer money path against the running local stack: settle, calls, claims, refunds, owed, close.
 local-check-a3:
 	npx tsx tests/local/a3-check.ts
+
+# Hidden-information leak probes L1-L21 (scripts/leak-probe.ts). Creates its own pool (table id
+# >= 70), drives ROUNDS rounds (default 3) and probes the house pool read-only. Exit code != 0 on
+# any FAIL. The full output is also written under $(LEAK_LOG_DIR) when that directory's parent exists.
+LEAK_LOG_DIR ?= docs/e2e
+LEAK_STAMP   := $(shell date -u +%Y%m%dT%H%M%SZ)
+leak-probe-local:
+	CLUSTER=local LEAK_LOG=$$([ -d $(dir $(LEAK_LOG_DIR)) ] && echo $(LEAK_LOG_DIR)/leak-probe-local-$(LEAK_STAMP).log) \
+	  npx tsx scripts/leak-probe.ts
+
+leak-probe-devnet:
+	CLUSTER=devnet LEAK_LOG=$$([ -d $(dir $(LEAK_LOG_DIR)) ] && echo $(LEAK_LOG_DIR)/leak-probe-devnet-$(LEAK_STAMP).log) \
+	  npx tsx scripts/leak-probe.ts
 
 # ---- house runner (house/): pools, bots, records. Local: after local-stack + local-fund.
 # Runs in the foreground; settings come from the environment (house/README.md), e.g.

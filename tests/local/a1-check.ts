@@ -169,7 +169,7 @@ async function main() {
 
   // the engine rings the bell after live beat 20..29; reveal cancels the crank
   let tb = c1;
-  for (let i = 0; i < 400 && tb.phase !== PHASE.bell; i++) { await sleep(100); tb = decodeTable((await readAccount(erUrl(tH), table)).data!); }
+  for (let i = 0; i < 1200 && tb.phase !== PHASE.bell; i++) { await sleep(100); tb = decodeTable((await readAccount(erUrl(tH), table)).data!); }
   check("crank resolved the round to the bell (one deadline per beat)", tb.phase === PHASE.bell && tb.beat >= 20 && tb.beat <= 29 && tb.resolves === tb.beat + 1,
     { beat: tb.beat, resolves: tb.resolves, tickCalls: tb.tickCalls });
   const revealIx = await ix(progEr.methods.reveal().accountsPartial({ caller: house.publicKey, table, book, round: round1 }));

@@ -10,7 +10,9 @@
     "test": "make test",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "spike": "tsx spike/scripts/run.ts",
-    "spike:probe": "tsx spike/scripts/probe-tee.ts"
+    "spike:probe": "tsx spike/scripts/probe-tee.ts",
+    "house": "tsx house/src/main.ts",
+    "house:i13": "tsx house/src/i13-check.ts"
   },
   "dependencies": {
     "@coral-xyz/anchor": "0.32.1",

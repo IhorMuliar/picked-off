@@ -11,5 +11,5 @@
     "resolveJsonModule": true,
     "types": ["node"]
   },
-  "include": ["spike/scripts/**/*.ts", "scripts/**/*.ts", "bots/**/*.ts", "tests/**/*.ts"]
+  "include": ["spike/scripts/**/*.ts", "scripts/**/*.ts", "bots/**/*.ts", "tests/**/*.ts", "house/**/*.ts"]
 }
