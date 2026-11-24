@@ -12,7 +12,9 @@ export function openLog(p: string) {
 
 const big = (_k: string, v: unknown) => (typeof v === "bigint" ? v.toString() : v);
 function write(level: string, ev: string, data: Record<string, unknown>) {
-  const line = JSON.stringify({ ts: new Date().toISOString(), level, ev, ...data }, big);
+  // Rollup login tokens travel in endpoint URLs, and error messages can quote those URLs:
+  // never let one reach a log line.
+  const line = JSON.stringify({ ts: new Date().toISOString(), level, ev, ...data }, big).replace(/token=[^&\s"\\]+/g, "token=<redacted>");
   process.stdout.write(line + "\n");
   file?.write(line + "\n");
 }
