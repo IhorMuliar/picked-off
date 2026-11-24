@@ -1,0 +1,20 @@
+[package]
+name = "ping-core"
+version = "0.1.0"
+description = "Picked Off rules engine: deterministic, integer-only, constant-work beat resolution"
+edition = "2021"
+publish = false
+
+[lib]
+name = "ping_core"
+
+[features]
+default = []
+# Derive bytemuck::Pod/Zeroable on the state types so a zero-copy account can embed them.
+bytemuck = ["dep:bytemuck"]
+
+[dependencies]
+bytemuck = { version = "1", features = ["derive", "min_const_generics"], optional = true }
+
+[dev-dependencies]
+serde_json = "1"

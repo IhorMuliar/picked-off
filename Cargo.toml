@@ -1,5 +1,5 @@
 [workspace]
-members = ["programs/*"]
+members = ["programs/*", "crates/*"]
 # spike/ (local-only, not in this repository) is its own workspace
 exclude = ["spike"]
 resolver = "2"
@@ -16,3 +16,7 @@ codegen-units = 1
 opt-level = 3
 incremental = false
 codegen-units = 1
+
+# The rules engine hashes in pure Rust off-chain; unoptimised it makes the test suite slow.
+[profile.dev.package.ping-core]
+opt-level = 3

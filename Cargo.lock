@@ -1450,7 +1450,17 @@ name = "ping"
 version = "0.1.0"
 dependencies = [
  "anchor-lang",
+ "bytemuck",
  "ephemeral-rollups-sdk",
+ "solana-sha256-hasher 3.1.0",
+]
+
+[[package]]
+name = "ping-core"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "serde_json",
 ]
 
 [[package]]
