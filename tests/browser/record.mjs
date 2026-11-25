@@ -13,7 +13,11 @@
  * <outDir>/events.jsonl logs the clock, toasts, header number, reveal check and every input sent.
  *
  * Env: ROUNDS=7 (full rounds to record after the join round) · VW=1280 VH=720 ZOOM=1.5 · QUALITY=88 ·
- *      TAPE_CALLS=2 · PEEK_ROUND=3 · CAPTURE_FROM=0 · EVERY_NTH=1 · CHROME=<binary>
+ *      TAPE_CALLS=2 · PEEK_ROUND=3 · CAPTURE_FROM=0 · EVERY_NTH=1 · CHROME=<binary> ·
+ *      MOBILE=1 (emulate a phone viewport of VW×VH with touch, e.g. VW=390 VH=844) ·
+ *      PROOF_ROUND=<n> (in that round's results, follow "Proof ›" to the replay line, then close) ·
+ *      TAPE_SHOW=1 (once a call's outcome is on the Tape chip, open the Tape sheet in the next HIDE for a few seconds) ·
+ *      TAPE_EVERY=2 (call in every n-th full round) · TAPE_HOLD=0 (ms the Tape sheet stays open after a call)
  */
 import { spawn, execFileSync } from "node:child_process";
 import fs from "node:fs";
@@ -32,6 +36,11 @@ const VW = Number(env("VW", 1280)), VH = Number(env("VH", 720)), ZOOM = Number(e
 const PW = Math.round(VW * ZOOM), PH = Math.round(VH * ZOOM);
 const TAPE_CALLS = Number(env("TAPE_CALLS", 2));
 const PEEK_ROUND = Number(env("PEEK_ROUND", 3));
+const PROOF_ROUND = Number(env("PROOF_ROUND", -1));
+const TAPE_SHOW = env("TAPE_SHOW", "") === "1";
+const TAPE_EVERY = Number(env("TAPE_EVERY", 2)); // call in every TAPE_EVERY-th full round
+const TAPE_HOLD = Number(env("TAPE_HOLD", 0)); // ms to keep the Tape sheet open after the call
+const MOBILE = env("MOBILE", "") === "1";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 fs.mkdirSync(path.join(out, "frames"), { recursive: true });
 const evlog = fs.createWriteStream(path.join(out, "events.jsonl"));
@@ -66,6 +75,18 @@ const SOUND_LOG = `(() => {
       return o.call(this, t, ...r);
     };
   }
+})();`;
+
+/** Every private result the page adds to its (screen-reader) result log, once, in order: the log keeps older entries. */
+const RESULT_LOG = `(() => {
+  window.__resNew = [];
+  new MutationObserver((ms) => {
+    for (const m of ms) for (const n of m.addedNodes) {
+      if (n.nodeType !== 1) continue;
+      const xs = n.matches('[data-testid=toasts] .toast') ? [n] : [...n.querySelectorAll('[data-testid=toasts] .toast')];
+      for (const x of xs) window.__resNew.push(x.textContent);
+    }
+  }).observe(document, { childList: true, subtree: true });
 })();`;
 
 function chromeBin() {
@@ -121,6 +142,11 @@ const ev = async (expr) => (await send("Runtime.evaluate", { expression: expr, r
 await send("Runtime.enable");
 await send("Page.enable");
 await send("Page.addScriptToEvaluateOnNewDocument", { source: SOUND_LOG });
+await send("Page.addScriptToEvaluateOnNewDocument", { source: RESULT_LOG });
+if (MOBILE) {
+  await send("Emulation.setDeviceMetricsOverride", { width: VW, height: VH, deviceScaleFactor: ZOOM, mobile: true });
+  await send("Emulation.setTouchEmulationEnabled", { enabled: true, maxTouchPoints: 5 });
+}
 
 /** A real mouse click at the centre of the first element matching sel. */
 async function click(sel, what, idx = 0) {
@@ -140,15 +166,18 @@ async function key(k, code, vk, what) {
 
 const SNAP = `(() => { const q = (s) => document.querySelector(s); const s = window.__poChain?.status?.(); const c = q('[data-testid=clock]');
   return { clock: c ? c.dataset.phase + ' ' + c.dataset.beat : '',
-    toasts: [...document.querySelectorAll('[data-testid=toasts] .toast')].map((e) => e.textContent),
+    toasts: (window.__resNew ?? []).splice(0),
     number: q('[data-testid=number]')?.textContent ?? '',
     check: q('[data-testid=check]')?.textContent ?? null,
     reveal: !!q('[data-testid=reveal]'), peek: !!q('[data-testid=peek]'),
+    call: q('[data-testid=tape-chip]')?.dataset.call ?? null, callRound: q('[data-testid=tape-chip]')?.dataset.callRound ?? null,
     takedesk: !!q('[data-testid=takedesk]'), join: !!q('[data-testid=join]'),
     tape: [...document.querySelectorAll('[data-testid=tape] button.call')].map((e) => (e.disabled ? '-' : '+') + (e.dataset.called ? 'CALLED' : e.textContent)),
     banner: (() => { const e = q('[data-testid=chain-status]'); return e && e.style.display !== 'none' ? e.textContent : null })(),
     seat: s?.seat ?? null, round: s?.round ?? null, readable: !!s?.deskReadable } })()`;
 
+/** Level of a price (as `priceOf` in app/src/state/types.ts): 100.12 is level 1, 99.89 level 24. */
+const levelOf = (p) => 10013 - Math.round(Number(p) * 100);
 const sounds = fs.createWriteStream(path.join(out, "sounds.jsonl"));
 async function pullSounds() {
   const xs = await ev("(window.__snd ?? []).splice(0)");
@@ -167,7 +196,7 @@ if (!CAPTURE_FROM) {
 await send("Page.navigate", { url });
 log({ nav: url });
 
-let last = {}, full = -1, lastRound = null, lastBeat = -1, calls = 0, peeked = false, lastPull = Date.now();
+let last = {}, fresh = [], full = -1, lastRound = null, lastBeat = -1, calls = 0, peeked = false, lastPull = Date.now();
 const done = new Set();
 const t0 = Date.now();
 try {
@@ -175,10 +204,10 @@ try {
     await sleep(120);
     const x = await ev(SNAP);
     if (!x) continue;
-    for (const k of ["clock", "number", "check", "reveal", "peek", "takedesk", "join", "banner", "seat", "round"])
+    for (const k of ["clock", "number", "check", "reveal", "peek", "takedesk", "join", "banner", "seat", "round", "call"])
       if (x[k] !== last[k]) log({ [k]: x[k] });
-    const newToasts = x.toasts.filter((t) => !(last.toasts ?? []).includes(t));
-    for (const t of newToasts) log({ toast: t });
+    for (const t of x.toasts) log({ toast: t });
+    fresh.push(...x.toasts);
     if (JSON.stringify(x.tape) !== JSON.stringify(last.tape)) log({ tape: x.tape });
     last = x;
     if (Date.now() - lastPull > 2000) {
@@ -205,13 +234,14 @@ try {
     const hide = x.clock.startsWith("hide");
     const beat = x.clock.startsWith("live") ? Number(x.clock.split(" ")[1]) : 0;
     // the Tape call goes first in HIDE: on chain, calls can close earlier than the panel says
-    if (hide && full >= 1 && calls < TAPE_CALLS && full % 2 === 0 && !done.has(`tape:${r}`)) {
+    if (hide && full >= 1 && calls < TAPE_CALLS && full % TAPE_EVERY === 0 && !done.has(`tape:${r}`)) {
       if (!x.tape.length) await click(".chip.tape", "open the Tape");
       const i = x.tape.findIndex((t) => t.startsWith("+"));
       if (i >= 0) {
         done.add(`tape:${r}`);
         calls++;
         await click("[data-testid=tape] button.call", "tape call (own desk)", x.seat);
+        if (TAPE_HOLD) await sleep(TAPE_HOLD);
         await key("Escape", "Escape", 27, "close the Tape");
       }
     }
@@ -219,14 +249,38 @@ try {
       done.add(`place:${r}`);
       await sleep(600);
       await click(`[data-level="${4 + Math.floor(Math.random() * 17)}"]`, "place");
+      // a settled outcome from an earlier round stays on the chip: show it in its sheet
+      if (TAPE_SHOW && x.call && x.call !== "open" && !done.has(`tapeshow:${x.callRound}`)) {
+        done.add(`tapeshow:${x.callRound}`);
+        await click(".chip.tape", "open the Tape (outcome)");
+        await sleep(4000);
+        await key("Escape", "Escape", 27, "close the Tape");
+      }
+    }
+    if (x.reveal && full === PROOF_ROUND && x.check?.includes("✓") && !done.has(`proof:${r}`)) {
+      done.add(`proof:${r}`);
+      await sleep(2500);
+      await click("[data-testid=check] .linkbtn", "results → Proof");
+      await sleep(900);
+      await ev(`document.querySelector('.check-line')?.scrollIntoView({ block: 'center', behavior: 'smooth' })`);
+      log({ input: "scroll", what: "replay line" });
+      await sleep(4500);
+      await key("Escape", "Escape", 27, "proof close");
+      continue;
     }
     if (!hide && !x.reveal && beat !== lastBeat && beat >= 1) {
       lastBeat = beat;
+      // act on the results that arrived since the last action only
+      const res = fresh.splice(0);
       if (x.peek) continue;
       if (full === PEEK_ROUND && !peeked && beat >= 4) {
         peeked = true;
         await click(".chip.peek", "peek open");
-        await sleep(700);
+        await sleep(1800);
+        // the reads and their answers in view together (the number stays on the header chip)
+        await ev(`document.querySelector('[data-testid=peek] .peekbtns')?.closest('section')?.scrollIntoView({ block: 'start', behavior: 'smooth' })`);
+        log({ input: "scroll", what: "peek reads" });
+        await sleep(900);
         for (const n of [1, 3, 4, 2, 5]) {
           await click(`[data-peek="${n}"]`, `peek ${n}`);
           for (let i = 0; i < 40; i++) {
@@ -241,10 +295,18 @@ try {
       }
       await sleep(250 + Math.random() * 500);
       // the result log: "FILL …", "auto FILL …", "miss …", "auto miss …", "PICKED OFF …"
-      if (x.toasts.some((t) => t.startsWith("PICKED OFF"))) await key("r", "KeyR", 82, "move");
-      else if (x.toasts.some((t) => t.startsWith("FILL"))) await key(" ", "Space", 32, "ping the fill again");
-      else if (x.toasts.some((t) => t.startsWith("auto FILL"))) await key(" ", "Space", 32, "ping the auto fill again");
-      else if (Math.random() < 0.8) await click(`[data-level="${1 + Math.floor(Math.random() * 24)}"]`, "ping");
+      const fillAt = (t) => t.match(/FILL (\d+\.\d+)/)?.[1];
+      const autoFill = res.map((t) => (t.startsWith("auto FILL") ? fillAt(t) : null)).find(Boolean);
+      if (res.some((t) => t.startsWith("PICKED OFF"))) await key("r", "KeyR", 82, "move");
+      else if (res.some((t) => t.startsWith("FILL"))) await key(" ", "Space", 32, "ping the fill again");
+      else if (autoFill) await click(`[data-level="${levelOf(autoFill)}"]`, "ping the auto fill again");
+      else if (Math.random() < 0.8) {
+        // never the own row: tapping your own order opens "Move to…"
+        const own = await ev(`Number(document.querySelector('[data-testid=order]')?.closest('[data-level]')?.dataset.level ?? 0)`);
+        let L = 1 + Math.floor(Math.random() * 24);
+        if (L === own) L = (L % 24) + 1;
+        await click(`[data-level="${L}"]`, "ping");
+      }
     }
   }
 } finally {
