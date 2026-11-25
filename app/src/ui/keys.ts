@@ -6,7 +6,7 @@ import { actions } from "../state/runtime";
 import { sfx, unlockAudio } from "../fx/sound";
 import { ASK, BID } from "./Book";
 import { moveTo, tapPrice, toggleMoveMode } from "./act";
-import { acted, useRound } from "./round";
+import { acted, notePing, useRound } from "./round";
 import { cancelQueued } from "./decide";
 import { isStale } from "./link";
 
@@ -54,6 +54,7 @@ export function useKeys() {
         const mk = me.lastFill !== null ? useRound.getState().marks[me.lastFill] : undefined;
         if (me.lastFill !== null && mk?.kind === "fill" && !mk.algo) {
           unlockAudio();
+          notePing(me.lastFill);
           actions().ping(me.lastFill);
           sfx.ping();
           acted();

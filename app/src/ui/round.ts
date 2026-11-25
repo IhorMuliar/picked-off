@@ -13,6 +13,8 @@ export interface Mark {
   kind: "fill" | "miss";
   beat: number;
   algo: boolean;
+  /** from the beat this browser took the desk over and not sent by this browser: quiet, but not labelled auto */
+  inherited?: boolean;
   /** lots taken by this ping (fill), tenths */
   tenths: number;
   /** escalation step of the skim per order: 1 = 0.5, 2 = 1.0, 3 = 1.5 */
@@ -32,6 +34,8 @@ export interface RoundMem {
   marks: Record<number, Mark>;
   /** id of the newest result per level, for the flash */
   flash: Record<number, { id: number; kind: "fill" | "miss"; algo: boolean }>;
+  /** pings this browser sent this round (beat at send, level): tells its own pings from inherited ones */
+  sent: { beat: number; level: number }[];
   hit: Hit | null;
   /** last own result (not auto) of any kind, for the score line */
   lastOwn: PrivateResult | null;
@@ -58,7 +62,7 @@ export interface RoundMem {
 }
 
 const empty = (round: number): RoundMem => ({
-  round, marks: {}, flash: {}, hit: null, lastOwn: null, autoFill: null, base: null, late: false, seatedAt: null,
+  round, marks: {}, flash: {}, sent: [], hit: null, lastOwn: null, autoFill: null, base: null, late: false, seatedAt: null,
   joinMove: null, moved: null, hidePick: null, log: [], coach: {}, acted: false,
 });
 export const useRound = create<RoundMem>()(() => empty(0));
@@ -154,9 +158,8 @@ export function feedRound(): () => void {
     let { hit, lastOwn, autoFill } = cur;
     const beatNow = s.clock.beat;
     // after a mid-round takeover, results of the joining beat come from the previous owner's queued action: quiet marks
-    const inherited = (x: PrivateResult) => cur.late && !!cur.seatedAt && x.beat <= cur.seatedAt.beat && x.kind !== "pickedoff";
-    for (const x0 of fresh) {
-      const x = inherited(x0) ? { ...x0, algo: true } : x0;
+    const attributed = fresh.map((x) => attribute(x, cur));
+    for (const x of attributed) {
       if (x.kind === "pickedoff") {
         hit = { id: x.id, beat: x.beat, tenths: x.tenths, count: x.count ?? 1, next: x.next };
         lastOwn = x;
@@ -167,7 +170,7 @@ export function feedRound(): () => void {
       const orders = Math.max(1, x.orders ?? 1);
       // skims are 0.5 / 1.0 / 1.5 per order: the size per order is the escalation step
       const step = x.kind === "fill" ? Math.min(3, Math.max(1, Math.round(x.tenths / orders / 5))) : 0;
-      marks[L] = { kind: x.kind, beat: x.beat, algo: x.algo, tenths: x.tenths, step, orders, next: x.next };
+      marks[L] = { kind: x.kind, beat: x.beat, algo: x.algo, inherited: x.inherited, tenths: x.tenths, step, orders, next: x.next };
       flash[L] = { id: x.id, kind: x.kind, algo: x.algo };
       if (!x.algo) lastOwn = x;
       if (x.kind === "fill" && x.algo) autoFill = { level: L, beat: x.beat };
@@ -182,6 +185,23 @@ export function feedRound(): () => void {
     unsub();
     if (resend) clearInterval(resend);
   };
+}
+
+/**
+ * Who a result belongs to. After a mid-round takeover, results of the joining beat can come from the previous owner's
+ * queued action: those are quiet (never drive a button) and carry no "auto" label, since the data cannot say whose
+ * they were. A ping this browser sent itself (same level, sent in that beat or the one before it landed) stays its own.
+ */
+export function attribute(x: PrivateResult, mem: Pick<RoundMem, "late" | "seatedAt" | "sent">): PrivateResult & { inherited?: boolean } {
+  if (!mem.late || !mem.seatedAt || x.beat > mem.seatedAt.beat || x.kind === "pickedoff" || x.algo) return x;
+  if (mem.sent.some((p) => p.level === x.level && (p.beat === x.beat || p.beat === x.beat - 1))) return x;
+  return { ...x, algo: true, inherited: true };
+}
+
+/** Remember a ping this browser sent (for `attribute`). */
+export function notePing(level: number) {
+  const beat = useGame.getState().clock.beat;
+  useRound.setState((s) => ({ sent: [...s.sent.slice(-15), { beat, level }] }));
 }
 
 /** The player did something on purpose this round. */

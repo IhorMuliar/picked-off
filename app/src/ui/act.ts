@@ -2,7 +2,7 @@
 import { actions } from "../state/runtime";
 import { useGame, useUi } from "../state/store";
 import { sfx, unlockAudio } from "../fx/sound";
-import { acted, useRound } from "./round";
+import { acted, notePing, useRound } from "./round";
 import { isStale } from "./link";
 import { LEVELS } from "../state/types";
 
@@ -28,6 +28,7 @@ export function tapPrice(L: number) {
     moveTo(L);
     return;
   }
+  notePing(L);
   actions().ping(L);
   sfx.ping();
   acted();

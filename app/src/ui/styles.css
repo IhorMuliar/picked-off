@@ -188,7 +188,7 @@ button:focus:not(:focus-visible){outline:none}
 .sheet-b h3{margin:0 0 6px;font-size:.875rem;font-weight:650}
 .lede{color:var(--n6);font-size:.84375rem;line-height:1.5;max-width:62ch}
 .fine{color:var(--n5);font-size:.75rem;line-height:1.5;margin-top:10px;max-width:62ch}
-.note{color:var(--n6);font-size:.8125rem;background:var(--n2);border-radius:8px;padding:8px 10px;margin-top:8px}
+.note:not(.hint){color:var(--n6);font-size:.8125rem;background:var(--n2);border-radius:8px;padding:8px 10px;margin-top:8px}
 @keyframes sheet-up{from{transform:translateY(24px);opacity:0}}
 @keyframes sheet-in{from{transform:translateX(24px);opacity:0}}
 
@@ -240,7 +240,8 @@ button:focus:not(:focus-visible){outline:none}
 .peekbtns .btn:disabled{opacity:.55}
 .console{font-family:var(--mono);font-size:.75rem;background:var(--n0);border:1px solid var(--n3);border-radius:10px;padding:10px 12px;line-height:1.55;white-space:pre-wrap;word-break:break-word;max-height:34vh;overflow:auto;color:var(--n6)}
 .console .ok{color:var(--n7)} .console .no{color:var(--n5)} .console .dim{color:var(--n4)} .console .cmd{color:var(--n6)}
-.check-line{font-size:.78125rem;color:var(--n6);word-break:break-all}
+.check-line{font-size:.78125rem;color:var(--n6);overflow-wrap:break-word}
+.check-line .hash{white-space:nowrap}
 .check-line a,.linkbtn{color:var(--n7);text-decoration:underline;text-underline-offset:3px;text-decoration-color:var(--n4)}
 .linkbtn{border:0;background:none;padding:0;font-size:inherit;display:inline-flex;align-items:center;gap:2px}
 kbd{font-family:var(--mono);font-size:.6875rem;border:1px solid var(--n4);border-bottom-width:2px;border-radius:4px;padding:0 5px;margin:0 1px;color:var(--n7);background:var(--n2)}

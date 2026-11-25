@@ -8,9 +8,9 @@ import { useEffect, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { useGame, useUi } from "../state/store";
 import { actions } from "../state/runtime";
-import { lots, priceOf } from "../state/types";
+import { LEVELS, lots, priceOf } from "../state/types";
 import { sfx, unlockAudio } from "../fx/sound";
-import { acted, seen, useRound } from "./round";
+import { acted, notePing, seen, useRound } from "./round";
 import { useLink } from "./link";
 import { keepSeat, moveTo, nudgeBook, toggleMoveMode } from "./act";
 
@@ -60,10 +60,21 @@ function useJoiningFor(joining: boolean) {
 
 const pingAgain = (L: number) => () => {
   unlockAudio();
+  notePing(L);
   actions().ping(L);
   sfx.ping();
   acted();
 };
+
+/** A real price level (1..24): level 0 means the desk has no order placed yet and has no price to show. */
+export const isLevel = (L: number | null | undefined): L is number => typeof L === "number" && L >= 1 && L <= LEVELS;
+
+/** The HIDE hint: never a price for a level that does not exist yet. */
+export function hideHint(picked: boolean, at: number, firstVisit: boolean): string {
+  if (!isLevel(at)) return firstVisit ? "Tap a price to hide your order there." : "Tap a price to hide your order.";
+  if (picked) return `Hidden at ${priceOf(at)}. Nobody else can see it.`;
+  return firstVisit ? "Tap a price to hide your order there." : `Your order hides at ${priceOf(at)} unless you tap another price.`;
+}
 
 export function useDecision(): Decision {
   const g = useGame(
@@ -136,7 +147,7 @@ export function useDecision(): Decision {
     const at = m.hidePick ?? me!.level;
     const picked = m.hidePick !== null;
     return {
-      hint: backHint ?? infoHint ?? (picked ? H(`Hidden at ${priceOf(at)}. Nobody else can see it.`) : H(firstVisit ? "Tap a price to hide your order there." : `Your order hides at ${priceOf(at)} unless you tap another price.`)),
+      hint: backHint ?? infoHint ?? H(hideHint(picked, at, firstVisit)),
       primary: picked
         ? { label: `Hidden at ${priceOf(at)}`, sub: `live in ${left.toFixed(1)} s`, tone: "quiet", state: "hidden" }
         : { label: "Tap a price to hide your order", sub: `live in ${left.toFixed(1)} s`, tone: "you", state: "hide", onClick: nudgeBook },
@@ -175,7 +186,7 @@ export function useDecision(): Decision {
   if (moveMode)
     return {
       hint: H("Tap the new price for your order."),
-      primary: { label: "Tap the new price", sub: `your order is at ${priceOf(me!.level)}`, tone: "plain", state: "movemode" },
+      primary: { label: "Tap the new price", sub: isLevel(me!.level) ? `your order is at ${priceOf(me!.level)}` : undefined, tone: "plain", state: "movemode" },
       secondary: { label: "Cancel", tone: "plain", state: "cancel-mode", onClick: toggleMoveMode, testid: "move" },
     };
   if (joining)
@@ -218,15 +229,15 @@ export function useDecision(): Decision {
       primary: { label: `Ping again ${priceOf(own)}`, sub: next, tone: "you", state: "again", onClick: pingAgain(own) },
       secondary: moveTo_,
     };
-  let hint = H(`No tap this beat? Auto pings ${priceOf(me!.nextAlgo)}.`);
+  let hint = H(isLevel(me!.nextAlgo) ? `No tap this beat? Auto pings ${priceOf(me!.nextAlgo)}.` : "Tap any price to look for hidden orders.");
   if (backHint) hint = backHint;
-  else if (joined) hint = H(`You're in. Your order is hidden at ${priceOf(me!.level)}.`, "join");
+  else if (joined && isLevel(me!.level)) hint = H(`You're in. Your order is hidden at ${priceOf(me!.level)}.`, "join");
   else if (m.moved && beat <= m.moved.beat + 1) hint = H(`Moved to ${priceOf(m.moved.level)}. Their bonus on you is reset.`);
   else if (firstVisit) hint = H(PROMISE, "promise");
   else if (g.atRisk && beat >= 15 && !m.acted) hint = H("Tap any price to keep your desk.", "coach");
   else if (infoHint) hint = infoHint;
   else if (m.autoFill && beat - m.autoFill.beat <= 1) hint = H(`Auto found one at ${priceOf(m.autoFill.level)}.`);
-  else if (!me!.nextAlgo) hint = H("Tap any price to look for hidden orders.");
+  else if (!isLevel(me!.nextAlgo)) hint = H("Tap any price to look for hidden orders.");
   return { hint, primary: tap, secondary: moveTo_ };
 }
 

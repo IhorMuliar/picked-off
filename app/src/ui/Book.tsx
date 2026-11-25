@@ -35,10 +35,10 @@ function Pips({ step, next }: { step: number; next?: boolean }) {
 
 function MarkView({ m, age, live, isLastFill, nextSkim }: { m: Mark; age: number; live: boolean; isLastFill: boolean; nextSkim: number }) {
   if (m.kind === "miss")
-    return m.algo ? <span className="mk dot" title="auto miss" /> : <span className="mk miss">miss</span>;
+    return m.algo ? <span className="mk dot" title={m.inherited ? "miss" : "auto miss"} /> : <span className="mk miss">miss</span>;
   return (
     <span className={"mk fill" + (m.algo ? " auto" : "") + (age > 6 ? " old" : "")}>
-      {m.algo && <span className="lbl">auto</span>}
+      {m.algo && !m.inherited && <span className="lbl">auto</span>}
       <b>+{lots(m.tenths)}</b>
       <Pips step={m.step} />
       {m.orders > 1 && (

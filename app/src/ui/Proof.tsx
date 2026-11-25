@@ -80,7 +80,14 @@ export function ProofSheet() {
         <h3>Replay check</h3>
         {chk ? (
           <p className={"mono check-line " + chk.check.state}>
-            Round {chk.round}: {chk.check.state === "ok" ? `replay ✓ ${short(chk.check.hash)} matches commit` : "replay ✗ the log does not match the commit"}
+            Round {chk.round}:{" "}
+            {chk.check.state === "ok" ? (
+              <>
+                replay ✓ <span className="hash">{short(chk.check.hash)}</span> matches commit
+              </>
+            ) : (
+              "replay ✗ the log does not match the commit"
+            )}
             {chk.url && (
               <>
                 {" · "}

@@ -9,15 +9,18 @@ import { MoveIcon, TapeIcon, CloseIcon } from "./icons";
 export function Hint({ hint }: { hint: ReturnType<typeof useDecision>["hint"] }) {
   const banner = useGame((s) => s.banner);
   return (
-    <p className={"hint " + hint.kind} aria-live="polite" data-testid={hint.kind === "join" ? "join" : undefined}>
-      {hint.text}
-      {/* the raw status line, for assistive tech and the browser checks */}
+    <>
+      <p className={"hint " + hint.kind} aria-live="polite" data-testid={hint.kind === "join" ? "join" : undefined}>
+        {hint.text}
+      </p>
+      {/* the raw status line, for assistive tech and the browser checks; kept out of the clamped hint box, where it
+          could push the hint text down under the buttons */}
       {banner && (
-        <span className="sr-only" data-testid="chain-status" data-kind={banner.kind}>
+        <span className="sr-only" data-testid="chain-status" data-kind={banner.kind} aria-live="polite">
           {banner.text}
         </span>
       )}
-    </p>
+    </>
   );
 }
 

@@ -44,7 +44,11 @@ const RoundBar = memo(function RoundBar() {
   const bellBeat = useGame((s) => s.reveal?.bellBeat ?? null);
   // the countdown text in HIDE / LIGHTS ON: a 200-ms text update, no per-frame work
   useEffect(() => {
-    if (phase !== "hide" && phase !== "lights") return;
+    // outside HIDE / LIGHTS ON the span holds no countdown: clear what the last phase wrote into it
+    if (phase !== "hide" && phase !== "lights") {
+      if (txt.current) txt.current.textContent = "";
+      return;
+    }
     const tick = () => {
       const c = useGame.getState().clock;
       const left = Math.max(0, c.phaseEndsAt - performance.now());
@@ -89,7 +93,7 @@ const RoundBar = memo(function RoundBar() {
           Bell {Math.round(chance * 100)} %
         </span>
       ) : (
-        <span className="bt" ref={txt} />
+        <span className="bt" ref={txt} key={phase} />
       )}
     </>
   );
