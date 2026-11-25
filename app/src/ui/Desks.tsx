@@ -47,8 +47,8 @@ export function DesksList({ inSheet }: { inSheet?: boolean }) {
   return (
     <div className="desks" data-testid="desks">
       <div className="desks-h">
-        <span>{inSheet ? "Ranked by lots taken" : "Desks"}</span>
-        <span>{reveal ? "taken · final" : "taken so far"}</span>
+        <span>{inSheet ? (reveal ? "Ranked by total lots" : "Ranked by lots taken") : "Desks"}</span>
+        <span>{reveal ? "taken · total" : "lots taken"}</span>
       </div>
       {seats.length === 0 ? (
         <p className="empty">Reading the table…</p>

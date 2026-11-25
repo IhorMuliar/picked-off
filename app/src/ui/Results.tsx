@@ -6,7 +6,7 @@ import { LEVELS, lots, type RevealView } from "../state/types";
 import { sfx } from "../fx/sound";
 import { Sheet } from "./Sheet";
 import { useRound } from "./round";
-import { ordinal } from "./Score";
+import { ordinal, RANK_FINAL, RANK_WHY } from "./Score";
 import { keepSeat } from "./act";
 import { openSheet } from "../state/store";
 import { Chevron } from "./icons";
@@ -145,24 +145,24 @@ export function ResultsSheet() {
   const place = mine !== null ? 1 + r.totals.filter((v, d) => d !== mySeat && v > mine).length : null;
   const d = mine !== null && base !== null ? mine - base : null;
   const left = Math.max(0, Math.ceil((phaseEndsAt - performance.now()) / 1000));
-  const sat = (late || base === null) && sum.hits === 0 && sum.took === 0;
   return (
     <Sheet id="results" title={mine !== null ? "Round over" : "Lights on"} testid="reveal" tall onClose={() => useUi.setState({ resultsClosed: r.round })}>
       {mine !== null ? (
         <div className="res-hero">
           <p className="place">
-            You finished <b>{ordinal(place!)}</b> of {r.totals.length}
+            You finished <b>{ordinal(place!)}</b> of {r.totals.length} <span className="by">{RANK_FINAL}</span>
           </p>
           <p className="num">
             <span className="big">{lots(mine)}</span> lots
-            {d !== null && (
-              <span className={"delta" + (d > 0 ? " gain" : d < 0 ? " loss" : "")}>
-                {d > 0 ? "+" : d < 0 ? "−" : "±"}
-                {lots(Math.abs(d))} {late ? "since joining" : ""}
+            {d !== null && d !== 0 && (
+              <span className={"delta" + (d > 0 ? " gain" : " loss")}>
+                {d > 0 ? "+" : "−"}
+                {lots(Math.abs(d))} {late ? "since joining" : "this round"}
               </span>
             )}
           </p>
-          {sat && <p className="line">You sat down near the end of this round.</p>}
+          <p className="why">{RANK_WHY}</p>
+          {(late || base === null) && <p className="line">You joined mid-round: this round was a warm-up.</p>}
         </div>
       ) : (
         <div className="res-hero">
@@ -171,26 +171,33 @@ export function ResultsSheet() {
       )}
       <ul className="res-lines">
         {mine !== null && (
-          <li className={sum.hits ? "loss" : ""}>
+          <li>
             {sum.hits === 0 ? (
               "Nobody found your order."
             ) : (
               <>
-                PICKED OFF {sum.hits}× · −{lots(sum.lost)} · by{" "}
-                {sum.hunters.map(([h, x], k) => (
+                PICKED OFF {sum.hits}× <span className="loss">−{lots(sum.lost)}</span> ·{" "}
+                {sum.hunters.slice(0, 2).map(([h, x], k) => (
                   <span key={h}>
                     {k ? ", " : ""}
                     {name(h)}
                     {x.n > 1 ? ` (${x.n}×)` : ""}
                   </span>
                 ))}
+                {sum.hunters.length > 2 ? ` +${sum.hunters.length - 2} more` : ""}
               </>
             )}
           </li>
         )}
-        {mine !== null && sum.took > 0 && (
-          <li className="gain">
-            You took +{lots(sum.took)} from {sum.victims} desk{sum.victims === 1 ? "" : "s"}.
+        {mine !== null && (
+          <li>
+            {sum.took > 0 ? (
+              <>
+                You took <span className="gain">+{lots(sum.took)}</span> from {sum.victims} desk{sum.victims === 1 ? "" : "s"}.
+              </>
+            ) : (
+              "You took nothing this round."
+            )}
           </li>
         )}
         <li>
@@ -198,14 +205,20 @@ export function ResultsSheet() {
           {seats[r.topDesk]?.kind === "bot" && <span className="bot">bot</span>} · {lots(r.totals[r.topDesk])} lots
         </li>
         {tape.myCall !== null && tape.paid !== undefined && (
-          <li className={tape.paid !== "refund" && tape.myCall === r.topDesk ? "gain" : ""}>
+          <li>
             Your call on {tape.myCall === mySeat ? "yourself" : name(tape.myCall)}{" "}
-            {tape.paid === "refund" ? `was refunded: nobody called ${name(r.topDesk)}.` : tape.myCall === r.topDesk ? `won ${tape.paid.toFixed(1)}×.` : "lost."}
+            {tape.paid === "refund" ? (
+              `was refunded: nobody called ${name(r.topDesk)}.`
+            ) : tape.myCall === r.topDesk ? (
+              <span className="gain">won {tape.paid.toFixed(1)}×.</span>
+            ) : (
+              "lost."
+            )}
           </li>
         )}
       </ul>
       <p className={"check " + r.check.state} data-testid="check">
-        {r.check.state === "ok" ? "Replay ✓ checked: every move matches the sealed round." : r.check.state === "fail" ? "Replay ✗ does not match the sealed round." : "Checking the replay…"}{" "}
+        {r.check.state === "ok" ? "Replay ✓ checked" : r.check.state === "fail" ? "Replay ✗ does not match the sealed round" : <span className="checking">Replay: checking…</span>}{" "}
         <button className="linkbtn" onClick={() => openSheet("proof")}>
           Proof <Chevron />
         </button>

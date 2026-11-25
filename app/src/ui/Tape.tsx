@@ -12,8 +12,8 @@ export interface TapeWindow {
   open: boolean;
   /** full label for the sheet */
   label: string;
-  /** short label for the chip */
-  short: string;
+  /** whole seconds until calls close, while open */
+  secs: number | null;
 }
 
 /** The call window: on the chain it is the program's (Tape.close_unix on the base clock); the mock follows the beats. */
@@ -23,13 +23,13 @@ export function tapeWindow(tape: TapeView, clock: Clock): TapeWindow {
     const rem = tape.closesAt != null ? remainingMs(tape.closesAt, Date.now()) : null;
     const open = inPlay && !!tape.recorded && rem !== null && canStartCall(rem);
     const label = !tape.recorded ? "No Tape this round" : rem === null ? "Reading the Tape…" : !inPlay ? "Calls closed" : windowLabel(rem).replace(/^c/, "C");
-    const short = open && rem !== null ? `${Math.ceil(rem / 1000)} s` : "Tape";
-    return { open, label, short };
+    return { open, label, secs: open && rem !== null ? Math.ceil(rem / 1000) : null };
   }
   const open = clock.phase === "hide" || (clock.phase === "live" && clock.beat <= tape.closeBeat);
   const n = tape.closeBeat - clock.beat + 1;
   const label = clock.phase === "hide" ? "Calls open" : open ? `Closes in ${n} beat${n === 1 ? "" : "s"}` : "Calls closed";
-  return { open, label, short: open ? (clock.phase === "hide" ? "open" : `${Math.ceil(n * 1.5)} s`) : "Tape" };
+  const secs = !open ? null : clock.phase === "hide" ? Math.ceil(Math.max(0, clock.phaseEndsAt - performance.now()) / 1000 + tape.closeBeat * 1.5) : Math.ceil(n * 1.5);
+  return { open, label, secs };
 }
 
 const fmt = (x: number) => (x >= 10 ? x.toFixed(0) : x.toFixed(1));
@@ -59,18 +59,25 @@ export function TapeSheet() {
   }
   // the chain pools hold lamports; the demo counts calls
   const staked = (x: number) => (chain ? `${(x / 1e9).toFixed(2)} SOL` : `${x} call${x === 1 ? "" : "s"}`);
-  const note = banner?.kind === "info" || (banner?.kind === "connecting" && /SOL|drip|Tape/.test(banner.text)) ? banner.text : null;
+  const note = banner?.kind === "info" ? banner.text : null;
+  const funding = banner?.kind === "connecting" && /SOL|drip/.test(banner.text);
   return (
     <Sheet id="tape" title="The Tape" testid="tape">
-      <p className="lede">Call which desk finishes on top. One call per round.</p>
+      <p className="cost">{chain ? "One call costs 0.01 devnet SOL · free from the faucet" : "Demo calls are free"}</p>
+      <p className="lede">Call which desk finishes on top. One call per round; the pot is split among the right calls.</p>
       <div className="tape-status">
         <span className={"win" + (w.open ? " open" : "")} data-testid="tape-window">
           {result ?? w.label}
         </span>
-        {tape.myCall !== null && <span className="mine">Your call: {tape.myCall === mySeat ? "you" : seats[tape.myCall]?.name}</span>}
+        {tape.myCall !== null && <span className="mine">Your call: {tape.myCall === mySeat ? "You" : seats[tape.myCall]?.name}</span>}
       </div>
-      {note && <p className="note">{note}</p>}
-      {tape.needsFunding && !note && tape.myCall === null && w.open && <p className="note">Your first call gets free devnet SOL from the drip. It takes a few seconds.</p>}
+      {funding ? (
+        <p className="note">Getting free devnet SOL from the faucet… your call is not placed yet.</p>
+      ) : note ? (
+        <p className="note">{note}</p>
+      ) : tape.needsFunding && tape.myCall === null && w.open ? (
+        <p className="note">Your first call fetches its 0.01 devnet SOL from the faucet first (a few seconds).</p>
+      ) : null}
       <div className="tape-rows">
         {seats.map((s, i) => {
           const called = tape.myCall === i;
@@ -81,7 +88,7 @@ export function TapeSheet() {
                 <span className="t">{i === mySeat ? "You" : s.name}</span>
                 {s.kind === "bot" && <span className="bot">bot</span>}
               </span>
-              <span className="pool">{tape.pool[i] > 0 ? `${staked(tape.pool[i])} · ${odds}` : "no calls yet"}</span>
+              <span className="pool">{tape.pool[i] > 0 ? `${staked(tape.pool[i])} · pays ${odds}` : "no calls yet"}</span>
               <button
                 className={"call" + (called ? " called" : "")}
                 data-called={called ? "1" : undefined}
@@ -99,10 +106,7 @@ export function TapeSheet() {
           );
         })}
       </div>
-      <p className="fine">
-        {chain ? "Each call is 0.01 devnet SOL. " : "Demo calls are free. "}Winners split the pot (parimutuel, zero rake). The closing
-        time is the program's own clock. Refunded if nobody called the top desk.
-      </p>
+      <p className="fine">Parimutuel, zero rake. The closing time is the program's own clock. Refunded if nobody called the top desk.</p>
     </Sheet>
   );
 }

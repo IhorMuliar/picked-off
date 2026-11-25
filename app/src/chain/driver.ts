@@ -174,6 +174,12 @@ class ChainDriver implements GameDriver {
     requote: (l) => this.requote(l),
     tapeCall: (d) => void this.tapeCall(d).catch((e) => this.flash(`call failed: ${(e as Error).message}`)),
     join: () => this.join(),
+    // withdraws the queued choice with the sender's existing "clear" message (the same one the bell uses)
+    cancel: () => {
+      if (!this.myDesk || this.table?.phase !== PHASE.live) return;
+      this.post({ type: "clear" });
+      this.setMe({ pending: { kind: "none" } });
+    },
   };
 
   readonly peek: PeekProbe = {
@@ -1185,7 +1191,7 @@ class ChainDriver implements GameDriver {
       this.w.set({ banner: b });
     }
     const seat: SeatState =
-      this.seat !== null ? (this.released ? "released" : "seated") : this.joining ? "joining" : this.waitingSeat ? "waiting" : !t || !this.tee.connection ? "connecting" : "joining";
+      this.seat !== null ? (this.released ? "released" : "seated") : this.joining ? "joining" : this.waitingSeat ? "waiting" : !t || !this.tee.connection ? "connecting" : "released";
     if (seat !== this.lastSeatState) {
       this.lastSeatState = seat;
       this.w.set({ seatState: seat });

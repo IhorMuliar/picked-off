@@ -79,6 +79,11 @@ export class MockDriver implements GameDriver {
     requote: (level) => this.requote(level),
     tapeCall: (desk) => this.tapeCall(desk),
     join: () => this.join(),
+    cancel: () => {
+      if (this.phase !== "live" || !this.me) return;
+      this.myAct = null;
+      this.setMe({ pending: { kind: "none" } });
+    },
   };
 
   readonly peek: PeekProbe = { run: (n) => this.runPeek(n) };

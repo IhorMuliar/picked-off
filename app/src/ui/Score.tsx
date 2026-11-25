@@ -2,8 +2,10 @@
 import { useEffect, useRef } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { openSheet, useGame } from "../state/store";
-import { BEAT_MS, BELL_MIN, HIDE_MS, LIGHTS_MS, lots } from "../state/types";
+import { BEAT_MS, BELL_MIN, HIDE_MS, lots } from "../state/types";
 import { useRound } from "./round";
+import { useLink } from "./link";
+import { useDecision } from "./decide";
 import { BellIcon, Chevron } from "./icons";
 import { sfx } from "../fx/sound";
 import { useUi } from "../state/store";
@@ -20,38 +22,50 @@ export function rankOf(seats: { picked: number }[], mySeat: number | null): numb
   return 1 + seats.filter((s, i) => i !== mySeat && s.picked > mine).length;
 }
 
-/** Fills left → right over each beat (HIDE: over the hiding time), with its label. Driven by rAF from the
- *  scheduled deadlines, so it keeps time without waiting for the network. */
-function BeatBar() {
-  const bar = useRef<HTMLSpanElement>(null);
+/** Rank by total lots after the bell (the reveal makes every total public). */
+export function finalRankOf(totals: number[], mySeat: number | null): number | null {
+  if (mySeat === null || totals[mySeat] === undefined) return null;
+  return 1 + totals.filter((v, i) => i !== mySeat && v > totals[mySeat]).length;
+}
+/** The one wording for ranks, used everywhere: live it is by lots taken (all that is public), after the bell by total. */
+export const RANK_LIVE = "in lots taken";
+export const RANK_FINAL = "by total lots";
+export const RANK_WHY = "Hidden lots are secret until the bell, so the live rank counts only lots taken.";
+
+const SEGS = 29;
+/**
+ * The round as 29 beats: past beats filled, the current one filling over its 1.5 s, and the zone from beat 20 where
+ * the bell can ring. Driven by rAF from the scheduled deadlines, so it keeps time without waiting for the network.
+ */
+function RoundBar() {
+  const box = useRef<HTMLSpanElement>(null);
   const txt = useRef<HTMLSpanElement>(null);
+  const stale = useLink((s) => s.stale);
   useEffect(() => {
     let raf = 0;
     const loop = () => {
       const c = useGame.getState().clock;
       const t = performance.now();
-      let frac = 0;
       let label = "";
+      let frac = 0;
       let hot = false;
       if (c.phase === "live") {
-        let end = c.beatEndsAt;
-        if (end > 0 && end < t) end += Math.ceil((t - end) / BEAT_MS) * BEAT_MS;
-        const left = end > 0 ? Math.min(BEAT_MS, end - t) : BEAT_MS;
-        frac = 1 - left / BEAT_MS;
-        hot = left < 300;
-        label = `beat ${c.beat}`;
+        const end = c.beatEndsAt;
+        const left = end > 0 ? Math.max(0, Math.min(BEAT_MS, end - t)) : BEAT_MS;
+        frac = useLink.getState().stale ? 0 : 1 - left / BEAT_MS;
+        hot = left < 300 && left > 0;
       } else if (c.phase === "hide") {
         const left = Math.max(0, c.phaseEndsAt - t);
         frac = 1 - Math.min(1, left / HIDE_MS);
         label = left > 0 ? `live in ${(left / 1000).toFixed(1)} s` : "going live";
       } else if (c.phase === "lights") {
         const left = Math.max(0, c.phaseEndsAt - t);
-        frac = Math.min(1, left / LIGHTS_MS);
         label = `next round ${Math.ceil(left / 1000)} s`;
       }
-      if (bar.current) {
-        bar.current.style.transform = `scaleX(${frac.toFixed(4)})`;
-        bar.current.classList.toggle("hot", hot);
+      const el = box.current;
+      if (el) {
+        el.style.setProperty("--f", frac.toFixed(3));
+        el.classList.toggle("hot", hot);
       }
       if (txt.current && txt.current.textContent !== label) txt.current.textContent = label;
       raf = requestAnimationFrame(loop);
@@ -59,26 +73,30 @@ function BeatBar() {
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
   }, []);
-  const phase = useGame((s) => s.clock.phase);
+  const { phase, beat, chance } = useGame(useShallow((s) => ({ phase: s.clock.phase, beat: s.clock.beat, chance: s.clock.bellChance })));
+  const bellBeat = useGame((s) => s.reveal?.bellBeat ?? null);
+  const cur = phase === "live" ? beat : 0;
+  const done = phase === "lights" ? (bellBeat ?? beat) : cur - 1;
+  const zone = phase === "live" && beat >= BELL_MIN;
   return (
     <>
-      <span className={"beatbar " + phase} aria-hidden="true">
-        <span className="fill" ref={bar} />
+      <span className={"roundbar " + phase + (zone ? " inzone" : "") + (stale ? " stale" : "")} ref={box} aria-hidden="true">
+        {Array.from({ length: SEGS }, (_, i) => {
+          const b = i + 1;
+          const cls = ["seg", b >= BELL_MIN && "zone", b <= done && "past", b === cur && "now", phase === "lights" && b === bellBeat && "bell"].filter(Boolean).join(" ");
+          return <i key={b} className={cls} />;
+        })}
+        <BellIcon size={11} className="zone-mark" />
       </span>
-      <span className="bt" ref={txt} />
+      {zone ? (
+        <span className="bt bellnow" title="The round ends on a hidden beat between 20 and 29. This is the chance it is this beat.">
+          <BellIcon size={14} />
+          Bell {Math.round(chance * 100)} %
+        </span>
+      ) : (
+        <span className="bt" ref={txt} />
+      )}
     </>
-  );
-}
-
-function Bell() {
-  const { phase, beat, chance } = useGame(useShallow((s) => ({ phase: s.clock.phase, beat: s.clock.beat, chance: s.clock.bellChance })));
-  if (phase !== "live") return null;
-  const hot = beat >= BELL_MIN;
-  return (
-    <span className={"bell" + (hot ? " hot" : "")} title="The round ends on a hidden beat between 20 and 29. This is the chance it is this beat.">
-      <BellIcon size={13} />
-      {hot ? `${Math.round(chance * 100)}%` : "from beat 20"}
-    </span>
   );
 }
 
@@ -87,7 +105,7 @@ function useBeatTick() {
   const phase = useGame((s) => s.clock.phase);
   useEffect(() => {
     if (phase !== "live" || beat < 2 || !useUi.getState().beatTick) return;
-    sfx.beat(useGame.getState().clock.bellChance >= 0.2);
+    sfx.beat(beat >= BELL_MIN);
   }, [beat, phase]);
 }
 
@@ -97,67 +115,82 @@ export function Score() {
   const { phase, beat } = useGame(useShallow((s) => ({ phase: s.clock.phase, beat: s.clock.beat })));
   const seats = useGame((s) => s.table.seats);
   const mySeat = useGame((s) => s.table.mySeat);
-  const seatState = useGame((s) => s.seatState);
-  const canJoin = useGame((s) => s.canJoin);
-  const { base, late, hit, lastOwn } = useRound(useShallow((s) => ({ base: s.base, late: s.late, hit: s.hit, lastOwn: s.lastOwn })));
+  const reveal = useGame((s) => s.reveal);
+  const { base, late, hit, lastOwn, seatedAt } = useRound(useShallow((s) => ({ base: s.base, late: s.late, hit: s.hit, lastOwn: s.lastOwn, seatedAt: s.seatedAt })));
+  const d0 = useDecision();
   const seated = !!me && mySeat !== null;
   const total = me ? me.resting + me.picked : 0;
-  const rank = rankOf(seats, mySeat);
   const n = seats.length || 8;
+  const joinBeat = late && seatedAt ? seatedAt.beat : -1;
 
   let delta: React.ReactNode = null;
-  if (seated) {
-    const recentHit = hit && beat - hit.beat <= 2 && phase === "live" && me!.pickedOffBeat !== null;
-    const recentFill = lastOwn?.kind === "fill" && beat - lastOwn.beat <= 1 && phase === "live";
-    if (recentHit)
+  let flash = "";
+  if (seated && phase === "live") {
+    const recentHit = hit && beat - hit.beat <= 2 && me!.pickedOffBeat !== null && hit.beat > joinBeat;
+    const recentFill = lastOwn?.kind === "fill" && beat - lastOwn.beat <= 1;
+    if (recentHit) {
+      delta = <span className="delta loss">−{lots(hit!.tenths)} PICKED OFF</span>;
+      flash = "hit-" + hit!.id;
+    } else if (recentFill) {
+      delta = <span className="delta gain">+{lots(lastOwn!.tenths)} FILL</span>;
+      flash = "fill-" + lastOwn!.id;
+    }
+  }
+  if (seated && !delta && base !== null && phase !== "hide") {
+    const d = total - base;
+    if (d !== 0)
       delta = (
-        <span className="delta loss">−{lots(hit!.tenths)} PICKED OFF</span>
-      );
-    else if (recentFill) delta = <span className="delta gain">+{lots(lastOwn!.tenths)} FILL</span>;
-    else if (base !== null) {
-      const d = total - base;
-      delta = (
-        <span className={"delta" + (d > 0 ? " gain" : d < 0 ? " loss" : "")}>
-          {d > 0 ? "+" : d < 0 ? "−" : "±"}
+        <span className={"delta" + (d > 0 ? " gain" : " loss")}>
+          {d > 0 ? "+" : "−"}
           {lots(Math.abs(d))} <span className="qual">{late ? "since joining" : "this round"}</span>
         </span>
       );
-    }
   }
 
-  let lead: React.ReactNode;
-  if (seated)
-    lead = (
-      <>
-        <span className="big">{lots(total)}</span>
-        <span className="unit">lots</span>
-        {delta}
-      </>
-    );
-  else if (phase === "connecting" && !seats.length) lead = <span className="state">Opening the book…</span>;
-  else if (seatState === "waiting") lead = <span className="state">Watching · all 8 desks are taken</span>;
-  else if ((canJoin && seatState !== "joining") || seatState === "released") lead = <span className="state">Watching · a desk is free</span>;
-  else lead = <span className="state">Taking your seat…</span>;
+  const lead = seated ? (
+    <>
+      <span key={flash} className={"big" + (flash.startsWith("hit") ? " hitflash" : flash.startsWith("fill") ? " fillflash" : "")}>
+        {lots(total)}
+      </span>
+      <span className="unit">lots</span>
+      {delta}
+    </>
+  ) : (
+    <span className="state">{d0.primary.state === "waiting" ? "Watching · all 8 desks are taken" : d0.primary.state === "join" ? "Watching · a desk is free" : d0.primary.label}</span>
+  );
+
+  // the rank, always with what it counts
+  let rank: React.ReactNode = null;
+  const fin = reveal && seated ? finalRankOf(reveal.totals, mySeat) : null;
+  const live = rankOf(seats, mySeat);
+  if (fin !== null) rank = <RankBtn place={fin} n={n} what={RANK_FINAL} />;
+  else if (seated && live !== null && seats.some((x) => x.picked > 0)) rank = <RankBtn place={live} n={n} what={RANK_LIVE} />;
 
   return (
     <div className="score" data-testid="mydesk">
       <div className="score-top">
         <div className="lead" aria-live="off">{lead}</div>
-        {rank !== null && seated && seats.some((x) => x.picked > 0) ? (
-          <button className="rank" onClick={() => openSheet("desks")} aria-label={`${ordinal(rank)} of ${n} by lots taken. Open the desks.`} title="Ranked by lots taken so far. Hidden lots stay secret until the bell.">
-            {ordinal(rank)} <span className="of">of {n}</span>
-            <Chevron />
-          </button>
-        ) : (
+        {rank ?? (
           <button className="rank quiet" onClick={() => openSheet("desks")} aria-label="Open the desks">
             Desks <Chevron />
           </button>
         )}
       </div>
       <div className="score-beat" data-testid="clock" data-phase={phase} data-beat={phase === "live" || phase === "lights" ? beat : 0}>
-        <BeatBar />
-        <Bell />
+        <RoundBar />
       </div>
     </div>
+  );
+}
+
+function RankBtn({ place, n, what }: { place: number; n: number; what: string }) {
+  return (
+    <button className="rank" data-testid="rank" onClick={() => openSheet("desks")} aria-label={`${ordinal(place)} of ${n} ${what}. Open the desks.`} title={RANK_WHY}>
+      <span className="r1">
+        {ordinal(place)} <span className="of">of {n}</span>
+        <Chevron />
+      </span>
+      <span className="r2">{what}</span>
+    </button>
   );
 }

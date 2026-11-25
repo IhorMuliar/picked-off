@@ -5,6 +5,6 @@ let current: GameDriver | null = null;
 export const setDriver = (d: GameDriver) => {
   current = d;
 };
-const noop: GameActions = { place() {}, ping() {}, requote() {}, tapeCall() {}, join() {} };
+const noop: GameActions = { place() {}, ping() {}, requote() {}, tapeCall() {}, join() {}, cancel() {} };
 export const actions = (): GameActions => current?.actions ?? noop;
 export const peekProbe = (): PeekProbe | null => current?.peek ?? null;

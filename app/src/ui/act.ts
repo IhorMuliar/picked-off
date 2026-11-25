@@ -2,15 +2,17 @@
 import { actions } from "../state/runtime";
 import { useGame, useUi } from "../state/store";
 import { sfx, unlockAudio } from "../fx/sound";
-import { acted } from "./round";
+import { acted, useRound } from "./round";
+import { isStale } from "./link";
 import { LEVELS } from "../state/types";
 
 export function tapPrice(L: number) {
   unlockAudio();
   const { me, clock } = useGame.getState();
-  if (!me || L < 1 || L > LEVELS) return;
+  if (!me || L < 1 || L > LEVELS || isStale()) return;
   useUi.setState({ interacted: true });
   if (clock.phase === "hide") {
+    useRound.setState({ hidePick: L });
     actions().place(L);
     sfx.requote();
     acted();
@@ -35,13 +37,14 @@ export function moveTo(L: number | null) {
   unlockAudio();
   const { me, clock } = useGame.getState();
   useUi.setState({ moveMode: false, interacted: true });
-  if (!me || clock.phase !== "live" || L === me.level) return;
+  if (!me || clock.phase !== "live" || L === me.level || isStale()) return;
   actions().requote(L);
   sfx.requote();
   acted();
 }
 
 export function toggleMoveMode() {
+  if (isStale()) return;
   unlockAudio();
   sfx.ui();
   useUi.setState({ moveMode: !useUi.getState().moveMode });
@@ -51,4 +54,10 @@ export function keepSeat() {
   unlockAudio();
   actions().join();
   acted();
+}
+
+/** "Tap a price" pressed: point at the book (rows pulse once). */
+export function nudgeBook() {
+  unlockAudio();
+  window.dispatchEvent(new CustomEvent("po:nudge"));
 }

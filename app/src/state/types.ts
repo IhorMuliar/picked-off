@@ -257,6 +257,8 @@ export interface GameActions {
   tapeCall(desk: number): void;
   /** Take a seat (spectator -> desk), or keep the seat for the next pool. */
   join(): void;
+  /** LIVE: withdraw this beat's queued ping or move (the auto acts instead). Optional for drivers. */
+  cancel?(): void;
 }
 
 export interface PeekLine {

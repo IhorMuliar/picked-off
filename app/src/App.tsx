@@ -2,7 +2,7 @@ import { useEffect } from "react";
 import { Header } from "./ui/Header";
 import { Score } from "./ui/Score";
 import { Book } from "./ui/Book";
-import { ActionBar, Hint } from "./ui/Action";
+import { ThumbZone } from "./ui/Action";
 import { DesksSheet, Rail } from "./ui/Desks";
 import { TapeSheet } from "./ui/Tape";
 import { ProofSheet } from "./ui/Proof";
@@ -10,6 +10,7 @@ import { ResultsSheet } from "./ui/Results";
 import { ResultLog } from "./ui/ResultLog";
 import { useKeys } from "./ui/keys";
 import { feedRound } from "./ui/round";
+import { feedLink } from "./ui/link";
 import { openSheet, useGame, useUi } from "./state/store";
 import { unlockAudio } from "./fx/sound";
 import "./ui/styles.css";
@@ -24,7 +25,7 @@ function useResultsSheet() {
     }
     const t = setTimeout(() => {
       if (useUi.getState().resultsClosed !== round) openSheet("results");
-    }, 900);
+    }, 450);
     return () => clearTimeout(t);
   }, [round]);
 }
@@ -33,6 +34,7 @@ export function App() {
   useKeys();
   useResultsSheet();
   useEffect(() => feedRound(), []);
+  useEffect(() => feedLink(), []);
   const sheet = useUi((s) => s.sheet);
   return (
     <div className={"app" + (sheet ? " has-sheet sheet-" + sheet : "")} onPointerDown={unlockAudio} onKeyDown={unlockAudio}>
@@ -41,8 +43,7 @@ export function App() {
         <div className="stage">
           <Score />
           <Book />
-          <Hint />
-          <ActionBar />
+          <ThumbZone />
         </div>
         <Rail />
       </main>

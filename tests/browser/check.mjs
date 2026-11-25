@@ -147,7 +147,8 @@ async function checkRound(withTape) {
       }
       if (!hide && beat >= 5 && !done.has(key("requote"))) {
         done.add(key("requote"));
-        await b.click("[data-testid=move]"); // Move to…, then the price
+        // Move to… (or a tap on your own order, which opens the same mode when that button shows Ping again), then the price
+        if (!(await b.click("[data-testid=move][data-state=moveto]"))) await b.click(".row.mine");
         if (await b.click(`[data-level="${2 + Math.floor(Math.random() * 20)}"]`)) seen.requotes++;
         if (seen.requotes === 1) await shot(b, "browser-live.png");
       }

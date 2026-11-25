@@ -7,6 +7,8 @@ import { sfx, unlockAudio } from "../fx/sound";
 import { ASK, BID } from "./Book";
 import { moveTo, tapPrice, toggleMoveMode } from "./act";
 import { acted, useRound } from "./round";
+import { cancelQueued } from "./decide";
+import { isStale } from "./link";
 
 function step(L: number, key: string): number {
   const bid = BID.indexOf(L);
@@ -27,13 +29,15 @@ export function useKeys() {
       if (onControl && (e.key === " " || e.key === "Enter")) return; // the focused control handles it
       const ui = useUi.getState();
       if (e.key === "Escape") {
+        const pend = useGame.getState().me?.pending;
         if (ui.moveMode) useUi.setState({ moveMode: false });
         else if (ui.sheet) openSheet(null);
+        else if (pend && pend.kind !== "none" && useGame.getState().clock.phase === "live") cancelQueued();
         else useUi.setState({ cursorOn: false });
         return;
       }
       const { me, clock } = useGame.getState();
-      if (!me || (clock.phase !== "live" && clock.phase !== "hide")) return;
+      if (!me || (clock.phase !== "live" && clock.phase !== "hide") || isStale()) return;
       if (e.key.startsWith("Arrow")) {
         e.preventDefault();
         useUi.setState({ selected: ui.cursorOn ? step(ui.selected, e.key) : ui.selected, cursorOn: true });
@@ -47,7 +51,8 @@ export function useKeys() {
       if (clock.phase !== "live") return;
       if (e.key === " ") {
         e.preventDefault();
-        if (me.lastFill !== null && useRound.getState().marks[me.lastFill]?.kind === "fill") {
+        const mk = me.lastFill !== null ? useRound.getState().marks[me.lastFill] : undefined;
+        if (me.lastFill !== null && mk?.kind === "fill" && !mk.algo) {
           unlockAudio();
           actions().ping(me.lastFill);
           sfx.ping();
