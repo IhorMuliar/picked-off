@@ -99,6 +99,8 @@ export function useDecision(): Decision {
     };
   }
   const b = link.back;
+  const info = g.banner?.kind === "info" ? g.banner.text : null;
+  const infoHint = info ? H(/^Tape call (on round \d+ )?settled/.test(info) ? "Your Tape call is settled: open the Tape to see it." : info, "note") : null;
   const backHint = b
     ? H(
         b.what === "bell" ? "Back. The bell rang while you were offline." : b.what === "newround" ? "Back. A new round started while you were offline."
@@ -134,7 +136,7 @@ export function useDecision(): Decision {
     const at = m.hidePick ?? me!.level;
     const picked = m.hidePick !== null;
     return {
-      hint: backHint ?? (picked ? H(`Hidden at ${priceOf(at)}. Nobody else can see it.`) : H(firstVisit ? "Tap a price to hide your order there." : `Your order hides at ${priceOf(at)} unless you tap another price.`)),
+      hint: backHint ?? infoHint ?? (picked ? H(`Hidden at ${priceOf(at)}. Nobody else can see it.`) : H(firstVisit ? "Tap a price to hide your order there." : `Your order hides at ${priceOf(at)} unless you tap another price.`)),
       primary: picked
         ? { label: `Hidden at ${priceOf(at)}`, sub: `live in ${left.toFixed(1)} s`, tone: "quiet", state: "hidden" }
         : { label: "Tap a price to hide your order", sub: `live in ${left.toFixed(1)} s`, tone: "you", state: "hide", onClick: nudgeBook },
@@ -146,7 +148,7 @@ export function useDecision(): Decision {
   if (phase !== "live") {
     const atRisk = g.atRisk && !m.acted;
     return {
-      hint: backHint ?? (atRisk ? H("You were away this round. Keep playing to keep your desk.", "coach") : H("Lights on: every hidden order is shown.")),
+      hint: backHint ?? (atRisk ? H("You were away this round. Keep playing to keep your desk.", "coach") : infoHint ?? H("Lights on: every hidden order is shown.")),
       primary: !g.revealed
         ? { label: "Lights on…", tone: "wait", state: "lights", disabled: true }
         : atRisk
@@ -222,6 +224,7 @@ export function useDecision(): Decision {
   else if (m.moved && beat <= m.moved.beat + 1) hint = H(`Moved to ${priceOf(m.moved.level)}. Their bonus on you is reset.`);
   else if (firstVisit) hint = H(PROMISE, "promise");
   else if (g.atRisk && beat >= 15 && !m.acted) hint = H("Tap any price to keep your desk.", "coach");
+  else if (infoHint) hint = infoHint;
   else if (m.autoFill && beat - m.autoFill.beat <= 1) hint = H(`Auto found one at ${priceOf(m.autoFill.level)}.`);
   else if (!me!.nextAlgo) hint = H("Tap any price to look for hidden orders.");
   return { hint, primary: tap, secondary: moveTo_ };

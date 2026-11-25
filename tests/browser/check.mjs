@@ -7,9 +7,11 @@
  *   round  one browser plays ROUNDS full rounds through the UI: place in HIDE, ping, re-quote,
  *          private-result toasts, the bell, "replay ✓ ... matches commit"; send cadence over 60 s;
  *          the 5 peek reads; the header number (beat -> private result); no uncaught errors
- *   tape   (only with TAPE=1: spends devnet SOL from the drip) one Tape call: CALLED, then claimed
+ *   tape   (only with TAPE=1: spends devnet SOL from the drip) one Tape call through the UI: "Called ✓", then the outcome
+ *          the player sees on the Tape chip (won / lost / refunded) and its payout settled on chain (the house sweep, or the
+ *          client's fallback claim 150 s later); after its last round the check keeps watching until TAPE_WAIT_S (default 240) after the call
  *
- * Env: CHECKS=join,round (default) · JOIN_N=5 · JOIN_GAP_MS=12000 · JOIN_PAR=2 (simultaneous joins, 0 = none) · ROUNDS=2 · TAPE=1 ·
+ * Env: CHECKS=join,round (default) · JOIN_N=5 · JOIN_GAP_MS=12000 · JOIN_PAR=2 (simultaneous joins, 0 = none) · ROUNDS=2 · TAPE=1 · TAPE_WAIT_S=240 ·
  *      SHOTS=<dir for screenshots> · OUT=<file for the JSON report> · CHROME=<binary>
  * Prints one PASS/FAIL line per check and exits 1 if any failed.
  */
@@ -84,7 +86,8 @@ const SNAP = `(() => { const q = (s) => document.querySelector(s); const s = win
     check: q('[data-testid=check]')?.textContent ?? null,
     tape: [...document.querySelectorAll('[data-testid=tape] button.call')].map((e) => (e.disabled ? '-' : '+') + (e.dataset.called ? 'CALLED' : e.textContent)),
     banner: (() => { const e = q('[data-testid=chain-status]'); return e && e.style.display !== 'none' ? e.textContent : null })(),
-    number: q('[data-testid=number]')?.textContent ?? '', s } })()`;
+    number: q('[data-testid=number]')?.textContent ?? '',
+    call: (() => { const c = q('[data-testid=tape-chip]'); return c?.dataset.call ? { outcome: c.dataset.call, round: c.dataset.callRound, settled: c.dataset.settled, text: c.textContent } : null })(), s } })()`;
 
 async function checkRound(withTape) {
   const rounds = Number(env("ROUNDS", 2));
@@ -97,7 +100,7 @@ async function checkRound(withTape) {
   try {
     await b.nav(url);
     const t0 = Date.now();
-    while (Date.now() - t0 < (rounds + 2) * 75000) {
+    while (Date.now() - t0 < (rounds + 2) * 75000 + (withTape ? Number(env("TAPE_WAIT_S", 240)) * 1000 : 0)) {
       await sleep(300);
       const x = await b.ev(SNAP);
       const tk = `${x?.s?.round}|${x?.s?.seat}|${x?.s?.deskReadable}|${x?.banner ?? ""}`;
@@ -107,7 +110,11 @@ async function checkRound(withTape) {
       if (r !== last) {
         full++;
         last = r;
-        if (full > rounds) break;
+      }
+      if (full > rounds) {
+        // the Tape payout settles after its round: keep watching the player's chip for a while
+        if (!withTape || !call || claimed || Date.now() - call.at > Number(env("TAPE_WAIT_S", 240)) * 1000) break;
+        continue;
       }
       const hide = x.clock.startsWith("hide");
       const beat = x.clock.startsWith("live") ? Number(x.clock.split(" ")[1]) : 0;
@@ -125,6 +132,12 @@ async function checkRound(withTape) {
       }
       if (/\d+ ms/.test(x.number) && !seen.headerFirst) seen.headerFirst = x.number;
       if (/settled and (claimed|paid)/.test(x.banner ?? "")) claimed = x.banner;
+      if (call && x.call && /^(won|lost|refunded)$/.test(x.call.outcome) && /^(settled|claimed|owed)$/.test(x.call.settled ?? "")) claimed = `${x.call.text}: ${x.call.outcome}, ${x.call.settled} (round ${x.call.round})`;
+      if (call && x.call?.outcome && x.call.outcome !== call.lastSeen) {
+        call.lastSeen = x.call.outcome;
+        (call.seen ??= []).push(`${Math.round((Date.now() - call.at) / 1000)}s ${x.call.text} ${x.call.outcome}/${x.call.settled || "-"}`);
+        if (call.seen.length <= 4) await shot(b, `browser-tape-${call.seen.length}.png`);
+      }
       if (full < 1) continue; // the join round is not a full round
       if (hide && !done.has(key("place"))) {
         done.add(key("place"));
@@ -196,7 +209,7 @@ async function checkRound(withTape) {
     line("number", fin?.resultLagN >= 8 && fin?.resultLagP95 !== null,
       { n: fin?.resultLagN, p50: Math.round(fin?.resultLagP50), p95: Math.round(fin?.resultLagP95), firstShown: seen.headerFirst, header: (await b.ev(SNAP))?.number, recent: lags.slice(-10) });
     if (withTape)
-      line("tape", !!call?.calledMs && !!claimed, { calledMs: call?.calledMs ?? null, settled: claimed || null });
+      line("tape", !!call?.calledMs && !!claimed, { calledMs: call?.calledMs ?? null, settled: claimed || null, seen: call?.seen ?? [] });
     line("errors", errs.exceptions.length === 0 && errs.consoleErr.length === 0, { exceptions: errs.exceptions.slice(0, 5), consoleErr: errs.consoleErr.slice(0, 5), logErr: errs.logErr.slice(0, 5) });
   } finally {
     await shot(b, "browser-end.png").catch(() => {});

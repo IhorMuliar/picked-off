@@ -5,6 +5,7 @@ import { useGame, useUi } from "../state/store";
 import { LEVELS, lots, type RevealView } from "../state/types";
 import { sfx } from "../fx/sound";
 import { Sheet } from "./Sheet";
+import { callWords, useLastCall } from "./lastcall";
 import { useRound } from "./round";
 import { ordinal, RANK_FINAL, RANK_WHY } from "./Score";
 import { keepSeat } from "./act";
@@ -108,6 +109,7 @@ export function ResultsSheet() {
   const phaseEndsAt = useGame((s) => s.clock.phaseEndsAt);
   const { base, late, acted } = useRound(useShallow((s) => ({ base: s.base, late: s.late, acted: s.acted })));
   const open = useUi((s) => s.sheet === "results");
+  const last = useLastCall((s) => s.call);
   const [, tick] = useState(0);
   useEffect(() => {
     if (!open) return;
@@ -214,6 +216,7 @@ export function ResultsSheet() {
             ) : (
               "lost."
             )}
+            {last && last.round === r.round && last.outcome !== "open" && <span className="lc-inline"> {callWords(last, r.round).detail}</span>}
           </li>
         )}
       </ul>

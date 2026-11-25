@@ -31,7 +31,7 @@ button:focus:not(:focus-visible){outline:none}
 .app{height:100vh;height:100dvh;display:flex;flex-direction:column;overflow:hidden;background:var(--n0)}
 
 /* ------------------------------------------------------------------ header */
-.top{flex:none;height:var(--hdr);display:flex;align-items:center;gap:12px;padding:0 var(--gut);border-bottom:1px solid var(--n2)}
+.topbar{flex:none;height:var(--hdr);display:flex;align-items:center;gap:12px;padding:0 var(--gut);border-bottom:1px solid var(--n2)}
 .brand{display:flex;align-items:center;gap:8px;white-space:nowrap}
 .brand .dot{width:8px;height:8px;border-radius:50%;background:var(--you);box-shadow:0 0 0 3px rgba(118,144,255,.18)}
 .brand .dot.off{background:var(--loss);box-shadow:0 0 0 3px rgba(255,90,100,.2);animation:breathe 1.2s ease-in-out infinite}
@@ -293,18 +293,21 @@ kbd{font-family:var(--mono);font-size:.6875rem;border:1px solid var(--n4);border
 @media (hover:hover){.rank:hover{background:var(--n1)}}
 
 .score-beat{display:flex;align-items:center;gap:10px;margin-top:8px;min-height:20px}
-.roundbar{position:relative;flex:1;display:flex;gap:2px;height:6px;align-items:stretch;--f:0}
+.roundbar{position:relative;flex:1;display:flex;gap:2px;height:6px;align-items:stretch}
+.roundbar .fl{position:absolute;inset:0;background:var(--n6);transform-origin:left center;transform:scaleX(0);animation-name:segfill;animation-timing-function:linear;animation-fill-mode:forwards;will-change:transform}
+.roundbar.inzone .fl{animation-name:segfill-hot}
+.roundbar .fl.hidefill{background:var(--you);animation-name:segfill-plain}
+.roundbar.stale .fl{animation-play-state:paused;opacity:.4}
+@keyframes segfill{0%{transform:scaleX(0);background:var(--n6)}80%{background:var(--n6)}81%{background:var(--n7)}100%{transform:scaleX(1);background:var(--n7)}}
+@keyframes segfill-hot{0%{transform:scaleX(0)}100%{transform:scaleX(1)}}
+@keyframes segfill-plain{0%{transform:scaleX(0)}100%{transform:scaleX(1)}}
+.roundbar.inzone .fl{background:var(--n7)}
 .roundbar .seg{flex:1;border-radius:1px;background:var(--n2);position:relative;overflow:hidden}
 .roundbar .seg.zone{background:#252B37}
 .roundbar .seg.zone::before{content:"";position:absolute;left:0;right:0;top:0;height:1px;background:var(--n4)}
 .roundbar .seg.past{background:var(--n5)}
 .roundbar.inzone .seg.past{background:var(--n6)}
-.roundbar .seg.now::after{content:"";position:absolute;inset:0;background:var(--n6);transform-origin:left center;transform:scaleX(var(--f))}
-.roundbar.hot .seg.now::after{background:var(--n7)}
-.roundbar.inzone .seg.now::after{background:var(--n7)}
 .roundbar .seg.bell{background:var(--n7)}
-.roundbar.hide .seg:first-child::after{content:"";position:absolute;inset:0;background:var(--you);transform-origin:left center;transform:scaleX(var(--f))}
-.roundbar.stale .seg.now::after{display:none}
 .roundbar .zone-mark{position:absolute;left:calc(19 / 29 * 100%);top:-14px;color:var(--n5)}
 .score-beat .bt{font-size:.8125rem;color:var(--n5);white-space:nowrap;min-width:7.5ch;text-align:right;font-variant-numeric:tabular-nums}
 .score-beat .bt.bellnow{display:inline-flex;align-items:center;gap:5px;color:var(--n7);font-size:.9375rem;font-weight:650;min-width:0}
@@ -359,6 +362,16 @@ kbd{font-family:var(--mono);font-size:.6875rem;border:1px solid var(--n4);border
 .book.nudge .row:not(.mine){animation:nudge .3s var(--ease) calc(var(--i,0) * 12ms)}
 @keyframes nudge{40%{border-color:var(--you)}}
 .book.lighting .hatch,.book.lit .hatch{transition-duration:.3s}
+
+/* the last Tape call, kept until dismissed */
+.lastcall{border:1px solid var(--n3);border-radius:12px;padding:10px 12px;margin:4px 0 12px;background:var(--n2)}
+.lastcall .lc-h{display:flex;justify-content:space-between;align-items:center;font-size:.75rem;color:var(--n5)}
+.lastcall .lc-t{font-size:.9375rem;font-weight:600;color:var(--n7);margin-top:2px}
+.lastcall .lc-d{font-size:.8125rem;color:var(--n6);margin-top:2px}
+.lastcall.won{border-color:rgba(243,180,67,.5)} .lastcall.won .lc-t{color:var(--gain)}
+.lc-inline{color:var(--n5)}
+.chip.tape.last.won{color:var(--gain);border-color:rgba(243,180,67,.45)}
+.chip.tape.last.refunded,.chip.tape.last.lost,.chip.tape.last.open{color:var(--n7);border-color:var(--n4)}
 
 /* ------------------------------------------------------------------ small phones */
 .chip .short{display:none}
@@ -452,7 +465,7 @@ kbd{font-family:var(--mono);font-size:.6875rem;border:1px solid var(--n4);border
 @media (max-height:540px) and (max-width:999px),(max-width:300px){
   .app{height:auto;min-height:100vh;min-height:100dvh;overflow:visible}
   body{overflow:auto}
-  .top{height:auto;min-height:var(--hdr);flex-wrap:wrap;row-gap:6px;padding-top:6px;padding-bottom:6px}
+  .topbar{height:auto;min-height:var(--hdr);flex-wrap:wrap;row-gap:6px;padding-top:6px;padding-bottom:6px}
   .chips{flex-wrap:wrap;justify-content:flex-end}
   .play{flex:none}
   .stage{overflow:visible}

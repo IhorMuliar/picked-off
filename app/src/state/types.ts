@@ -243,6 +243,14 @@ export interface GameView {
   banner?: StatusLine | null;
   /** The seat goes back to a bot at the next round unless the player acts (ping, move, hide, call or join). */
   seatAtRisk?: boolean;
+  /**
+   * Chain driver: what happened to this browser's Tape calls after their round, by round number.
+   * "settled": the Call was paid out and closed (by the house sweep or anyone); "claimed": this browser's own fallback
+   * claim paid it; "owed": the payout is too small to send yet and is kept on the Call.
+   */
+  tapeSettled?: Record<number, "settled" | "claimed" | "owed">;
+  /** Size of one Tape call, lamports (chain driver; 0.01 devnet SOL). */
+  callLamports?: number;
 }
 
 /** Player intent. The driver implements these; all are fire-and-forget. */

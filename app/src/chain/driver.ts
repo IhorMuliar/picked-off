@@ -996,10 +996,12 @@ class ChainDriver implements GameDriver {
         if (!call) {
           this.pendingClaims.delete(id);
           this.flash(`Tape call on round ${p.n} settled`);
+          this.markSettled(p.n, "settled");
           continue;
         }
         if (call.claimed || call.owed > 0n) {
           this.pendingClaims.delete(id);
+          this.markSettled(p.n, call.owed > 0n ? "owed" : "settled");
           continue;
         }
         if (now() - p.calledAt < CLAIM_AFTER_MS || p.tries >= 5) continue;
@@ -1007,6 +1009,7 @@ class ChainDriver implements GameDriver {
         try {
           await this.claim(p.t, p.n);
           this.pendingClaims.delete(id);
+          this.markSettled(p.n, "claimed");
         } catch {
           /* not committed yet, or already claimed in between: preflight refused it, nothing landed */
         }
@@ -1014,6 +1017,11 @@ class ChainDriver implements GameDriver {
     } finally {
       this.claiming = false;
     }
+  }
+
+  /** Tell the screen what happened to a call after its round (it keeps the outcome after the round changes). */
+  private markSettled(n: bigint, state: "settled" | "claimed" | "owed") {
+    this.w.set((s) => ({ tapeSettled: { ...(s.tapeSettled ?? {}), [Number(n)]: state } }));
   }
 
   private async funded(need: number): Promise<boolean> {
@@ -1048,6 +1056,7 @@ class ChainDriver implements GameDriver {
     if (!open()) return this.flash(this.tapeClosesAt() === null ? "could not read the Tape's closing time: try again" : "calls closed for this round");
     if (!this.config) await this.loadConfig();
     const callLamports = Number(this.config?.callLamports ?? 10_000_000n);
+    this.w.set({ callLamports });
     const rent = await this.base.connection.getMinimumBalanceForRentExemption(CALL_ACCOUNT_BYTES);
     const need = callLamports + rent + BASE_FEE_RESERVE;
     if (!(await this.funded(need)) && !(await this.drip(need))) return;

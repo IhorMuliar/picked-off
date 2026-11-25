@@ -11,6 +11,7 @@ import { ResultLog } from "./ui/ResultLog";
 import { useKeys } from "./ui/keys";
 import { feedRound } from "./ui/round";
 import { feedLink } from "./ui/link";
+import { feedLastCall } from "./ui/lastcall";
 import { openSheet, useGame, useUi } from "./state/store";
 import { unlockAudio } from "./fx/sound";
 import "./ui/styles.css";
@@ -35,6 +36,7 @@ export function App() {
   useResultsSheet();
   useEffect(() => feedRound(), []);
   useEffect(() => feedLink(), []);
+  useEffect(() => feedLastCall(), []);
   const sheet = useUi((s) => s.sheet);
   return (
     <div className={"app" + (sheet ? " has-sheet sheet-" + sheet : "")} onPointerDown={unlockAudio} onKeyDown={unlockAudio}>

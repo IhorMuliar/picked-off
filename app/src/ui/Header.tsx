@@ -4,6 +4,7 @@ import { setMuted, sfx, unlockAudio } from "../fx/sound";
 import { ShieldIcon, SoundIcon, TapeIcon } from "./icons";
 import { tapeWindow } from "./Tape";
 import { useLink } from "./link";
+import { callWords, useLastCall } from "./lastcall";
 
 /** The header shows the measured number only once this many beats are measured. */
 export const MIN_SAMPLES = 8;
@@ -19,17 +20,25 @@ function TapeChip() {
   }, []);
   const w = tapeWindow(tape, clock);
   const called = tape.myCall !== null;
+  const last = useLastCall((s) => s.call);
+  const round = useGame((s) => s.table.round);
+  // the last call's outcome stays on the chip until dismissed or the next call
+  const lc = last && !last.dismissed && (last.outcome !== "open" || last.round !== round) ? callWords(last, round) : null;
   // always the word "Tape": "Tape 9 s" while calls are open, "Tape ✓" once you called, else "Tape"
-  const text = called ? "Tape ✓" : w.open && w.secs !== null ? `Tape ${w.secs} s` : "Tape";
+  const text = lc ? lc.chip : called ? "Tape ✓" : w.open && w.secs !== null ? `Tape ${w.secs} s` : "Tape";
   return (
     <button
-      className={"chip tape" + (w.open && !called ? " open" : "") + (sheet === "tape" ? " on" : "")}
+      className={"chip tape" + (w.open && !called && !lc ? " open" : "") + (sheet === "tape" ? " on" : "") + (lc ? " last " + last!.outcome : "")}
+      data-testid="tape-chip"
+      data-call={last && !last.dismissed ? last.outcome : undefined}
+      data-call-round={last && !last.dismissed ? last.round : undefined}
+      data-settled={last && !last.dismissed ? (last.settled ?? "") : undefined}
       onClick={() => {
         unlockAudio();
         sfx.ui();
         openSheet(sheet === "tape" ? null : "tape");
       }}
-      aria-label={called ? "The Tape: you called" : w.open && w.secs !== null ? `The Tape: calls close in ${w.secs} seconds` : "The Tape"}
+      aria-label={lc ? `The Tape: ${lc.title}. ${lc.detail}` : called ? "The Tape: you called" : w.open && w.secs !== null ? `The Tape: calls close in ${w.secs} seconds` : "The Tape"}
     >
       <TapeIcon />
       <span>{text}</span>
@@ -78,7 +87,7 @@ export function Header() {
   const source = useGame((s) => s.table.source);
   const offline = useLink((s) => s.stale);
   return (
-    <header className="top">
+    <header className="topbar">
       <div className="brand">
         <span className={"dot" + (offline ? " off" : "")} aria-hidden="true" />
         <span className="word">Picked off</span>

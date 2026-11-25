@@ -3,7 +3,7 @@
  * (100.01 ↑ 100.12) on the right, best prices on the top row. Every row is one tap. Results land on the row they
  * concern; your own order is always a chip on its row; marks stay for the round so the book becomes your map.
  */
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { memo, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { recordLatency, useGame, useUi } from "../state/store";
 import { BEAT_MS, lots, priceOf, type RevealView, type Seat } from "../state/types";
@@ -112,11 +112,83 @@ function useResultFx() {
   }, [log]);
 }
 
+interface RowProps {
+  L: number;
+  i: number;
+  side: "bid" | "ask";
+  cls: string;
+  label: string;
+  disabled: boolean;
+  seen: number;
+  flash?: { id: number; kind: "fill" | "miss"; algo: boolean };
+  ring?: number;
+  /** what the row's slot shows */
+  slot: "lit" | "mine" | "queued" | "dest" | "joining" | "target" | "mark" | "auto" | "none";
+  reveal?: RevealView | null;
+  seats?: Seat[];
+  mySeat?: number | null;
+  wide?: boolean;
+  hidden?: number;
+  hitTenths?: number;
+  hitCount?: number;
+  hitId?: number;
+  moved?: boolean;
+  mark?: Mark;
+  age?: number;
+  live?: boolean;
+  lastFill?: boolean;
+  nextSkim?: number;
+}
+
+/** One price row. Memoized: a beat or a tap re-renders only the rows whose look changed. */
+const Row = memo(function Row(p: RowProps) {
+  return (
+    <button type="button" className={p.cls} data-level={p.L} aria-label={p.label} disabled={p.disabled} style={{ "--seen": p.seen, "--i": p.i } as React.CSSProperties}>
+      <span className="hatch" aria-hidden="true" />
+      {p.flash && p.slot !== "mine" && <span key={p.flash.id} className={"burst " + p.flash.kind + (p.flash.algo ? " auto" : "")} aria-hidden="true" />}
+      {p.ring !== undefined && <span key={"ring" + p.ring} className="burst ring" aria-hidden="true" />}
+      <span className="px">{priceOf(p.L)}</span>
+      <span className="slot">
+        {p.slot === "lit" ? (
+          <LitTags L={p.L} r={p.reveal!} seats={p.seats!} mySeat={p.mySeat ?? null} wide={!!p.wide} />
+        ) : p.slot === "mine" ? (
+          <>
+            <span key={p.hitId ?? "chip"} className={"chip-order" + (p.hitId !== undefined ? " hit" : "")} data-testid="order">
+              You{!!p.hidden && <b>{lots(p.hidden)}</b>}
+            </span>
+            {p.hitId !== undefined ? (
+              <span className="hitlbl">
+                −{lots(p.hitTenths!)}
+                {p.hitCount! > 1 ? ` ×${p.hitCount}` : ""}
+              </span>
+            ) : p.moved ? (
+              <span className="movedlbl">moved here</span>
+            ) : null}
+          </>
+        ) : p.slot === "queued" ? (
+          <span className="q">ping</span>
+        ) : p.slot === "dest" || p.slot === "joining" ? (
+          <span className="q">{p.slot === "joining" ? "hiding here" : "move here"}</span>
+        ) : p.slot === "target" ? (
+          <span className="tgt">move here</span>
+        ) : p.slot === "mark" ? (
+          <MarkView m={p.mark!} age={p.age!} live={!!p.live} isLastFill={!!p.lastFill} nextSkim={p.nextSkim ?? 5} />
+        ) : p.slot === "auto" ? (
+          <span className="mk autonext">auto</span>
+        ) : null}
+      </span>
+    </button>
+  );
+});
+
+const NO_SEATS: Seat[] = [];
+
 export function Book() {
   const me = useGame((s) => s.me);
   const { phase, beat } = useGame(useShallow((s) => ({ phase: s.clock.phase, beat: s.clock.beat })));
   const reveal = useGame((s) => s.reveal);
-  const seats = useGame((s) => s.table.seats);
+  // the seat list changes on every table update; the book needs it only for the lights-on tags
+  const seats = useGame((s) => (s.reveal ? s.table.seats : NO_SEATS));
   const mySeat = useGame((s) => s.table.mySeat);
   const stale = useLink((s) => s.stale);
   const r = useRound(
@@ -151,12 +223,16 @@ export function Book() {
     return () => clearTimeout(t);
   }, [revealRound]);
 
-  // drag your order chip to a price (a precise move in one gesture)
+  // one set of handlers for the whole book (rows stay memoized): tap, and drag your chip for a precise move
   const drag = useRef<{ id: number; x: number; y: number; on: boolean } | null>(null);
   const [dragOver, setDragOver] = useState<number | null>(null);
   const suppress = useRef(false);
   const levelAt = (x: number, y: number) => {
     const el = document.elementFromPoint(x, y)?.closest<HTMLElement>("[data-level]");
+    return el ? Number(el.dataset.level) : null;
+  };
+  const rowOf = (t: EventTarget | null) => {
+    const el = (t as HTMLElement | null)?.closest?.<HTMLElement>("[data-level]");
     return el ? Number(el.dataset.level) : null;
   };
 
@@ -172,7 +248,6 @@ export function Book() {
     const mine = seated && orderAt === L && lit < 2;
     const m = marks[L];
     const age = m ? beat - m.beat : 0;
-    const f = flash[L];
     const queued = live && pending?.kind === "ping" && pending.level === L;
     const dest = live && pending?.kind === "requote" && pending.level === L;
     const joining = dest && r.joinMove?.level === L;
@@ -190,85 +265,17 @@ export function Book() {
     if (mine) label += ", your order";
     if (m) label += m.kind === "fill" ? `, FILL +${lots(m.tenths)}` : ", miss";
     if (queued) label += ", ping queued";
-    const hidden = me ? me.resting : 0;
-    return (
-      <button
-        key={L}
-        type="button"
-        className={cls}
-        data-level={L}
-        aria-label={label}
-        disabled={stale && phase !== "connecting"}
-        style={{ "--seen": seenFrac, "--i": i } as React.CSSProperties}
-        onClick={() => {
-          if (suppress.current) {
-            suppress.current = false;
-            return;
-          }
-          useUi.setState({ cursorOn: false, selected: L });
-          tapPrice(L);
-        }}
-        onPointerDown={(e) => {
-          if (!mine || !live || e.button !== 0) return;
-          drag.current = { id: e.pointerId, x: e.clientX, y: e.clientY, on: false };
-          e.currentTarget.setPointerCapture?.(e.pointerId);
-        }}
-        onPointerMove={(e) => {
-          const d = drag.current;
-          if (!d || d.id !== e.pointerId) return;
-          if (!d.on && Math.hypot(e.clientX - d.x, e.clientY - d.y) > 10) d.on = true;
-          if (d.on) setDragOver(levelAt(e.clientX, e.clientY));
-        }}
-        onPointerUp={(e) => {
-          const d = drag.current;
-          drag.current = null;
-          if (!d || !d.on) return;
-          setDragOver(null);
-          const to = levelAt(e.clientX, e.clientY);
-          suppress.current = true;
-          setTimeout(() => (suppress.current = false), 400);
-          if (to && to !== me!.level) moveTo(to);
-        }}
-        onPointerCancel={() => {
-          drag.current = null;
-          setDragOver(null);
-        }}
-      >
-        <span className="hatch" aria-hidden="true" />
-        {f && !mine && <span key={f.id} className={"burst " + f.kind + (f.algo ? " auto" : "")} aria-hidden="true" />}
-        {mine && hitNow && <span key={"ring" + hit!.id} className="burst ring" aria-hidden="true" />}
-        <span className="px">{priceOf(L)}</span>
-        <span className="slot">
-          {lit === 2 && reveal ? (
-            <LitTags L={L} r={reveal} seats={seats} mySeat={mySeat} wide={wide} />
-          ) : mine ? (
-            <>
-              <span key={hitNow ? hit!.id : "chip"} className={"chip-order" + (hitNow ? " hit" : "")} data-testid="order">
-                You{hidden > 0 && <b>{lots(hidden)}</b>}
-              </span>
-              {hitNow ? (
-                <span className="hitlbl">
-                  −{lots(hit!.tenths)}
-                  {hit!.count > 1 ? ` ×${hit!.count}` : ""}
-                </span>
-              ) : movedHere ? (
-                <span className="movedlbl">moved here</span>
-              ) : null}
-            </>
-          ) : queued ? (
-            <span className="q">ping</span>
-          ) : dest ? (
-            <span className="q">{joining ? "hiding here" : "move here"}</span>
-          ) : target ? (
-            <span className="tgt">move here</span>
-          ) : m ? (
-            <MarkView m={m} age={age} live={live} isLastFill={me?.lastFill === L && !m.algo} nextSkim={me?.nextSkim ?? 5} />
-          ) : auto ? (
-            <span className="mk autonext">auto</span>
-          ) : null}
-        </span>
-      </button>
-    );
+    const slot: RowProps["slot"] =
+      lit === 2 && reveal ? "lit" : mine ? "mine" : queued ? "queued" : joining ? "joining" : dest ? "dest" : target ? "target" : m ? "mark" : auto ? "auto" : "none";
+    const props: RowProps = {
+      L, i, side, cls, label, disabled: stale && phase !== "connecting", seen: seenFrac, flash: mine ? undefined : flash[L], slot,
+      ring: mine && hitNow ? hit!.id : undefined,
+    };
+    if (slot === "lit") Object.assign(props, { reveal, seats, mySeat, wide });
+    if (slot === "mine")
+      Object.assign(props, { hidden: me ? me.resting : 0, moved: movedHere, ...(hitNow ? { hitTenths: hit!.tenths, hitCount: hit!.count, hitId: hit!.id } : {}) });
+    if (slot === "mark") Object.assign(props, { mark: m, age: age > 6 ? 7 : 0, live, lastFill: me?.lastFill === L && !m!.algo, nextSkim: me?.nextSkim ?? 5 });
+    return <Row key={L} {...props} />;
   };
 
   const cls = [
@@ -276,7 +283,48 @@ export function Book() {
     stale && phase !== "connecting" && "offline", phase === "connecting" && "dark",
   ].filter(Boolean).join(" ");
   return (
-    <section key={"n" + nudge} className={cls + (nudge ? " nudge" : "")} data-testid="ladder" aria-label="Order book: 24 prices">
+    <section
+      key={"n" + nudge}
+      className={cls + (nudge ? " nudge" : "")}
+      data-testid="ladder"
+      aria-label="Order book: 24 prices"
+      onClick={(e) => {
+        const L = rowOf(e.target);
+        if (L === null) return;
+        if (suppress.current) {
+          suppress.current = false;
+          return;
+        }
+        useUi.setState({ cursorOn: false, selected: L });
+        tapPrice(L);
+      }}
+      onPointerDown={(e) => {
+        const L = rowOf(e.target);
+        if (L === null || L !== orderAt || !live || e.button !== 0) return;
+        drag.current = { id: e.pointerId, x: e.clientX, y: e.clientY, on: false };
+        (e.target as HTMLElement).closest<HTMLElement>("[data-level]")?.setPointerCapture?.(e.pointerId);
+      }}
+      onPointerMove={(e) => {
+        const d = drag.current;
+        if (!d || d.id !== e.pointerId) return;
+        if (!d.on && Math.hypot(e.clientX - d.x, e.clientY - d.y) > 10) d.on = true;
+        if (d.on) setDragOver(levelAt(e.clientX, e.clientY));
+      }}
+      onPointerUp={(e) => {
+        const d = drag.current;
+        drag.current = null;
+        if (!d || !d.on) return;
+        setDragOver(null);
+        const to = levelAt(e.clientX, e.clientY);
+        suppress.current = true;
+        setTimeout(() => (suppress.current = false), 400);
+        if (to && me && to !== me.level) moveTo(to);
+      }}
+      onPointerCancel={() => {
+        drag.current = null;
+        setDragOver(null);
+      }}
+    >
       <div className="col bid">{BID.map((L, i) => row(L, i, "bid"))}</div>
       <div className="spine" aria-hidden="true" />
       <div className="col ask">{ASK.map((L, i) => row(L, i, "ask"))}</div>

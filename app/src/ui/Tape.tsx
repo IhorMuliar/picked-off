@@ -7,6 +7,7 @@ import { sfx, unlockAudio } from "../fx/sound";
 import { canStartCall, remainingMs, windowLabel } from "../chain/tapewindow";
 import { acted } from "./round";
 import { Sheet } from "./Sheet";
+import { callWords, dismissLastCall, useLastCall } from "./lastcall";
 
 export interface TapeWindow {
   open: boolean;
@@ -61,8 +62,24 @@ export function TapeSheet() {
   const staked = (x: number) => (chain ? `${(x / 1e9).toFixed(2)} SOL` : `${x} call${x === 1 ? "" : "s"}`);
   const note = banner?.kind === "info" ? banner.text : null;
   const funding = banner?.kind === "connecting" && /SOL|drip/.test(banner.text);
+  const last = useLastCall((x) => x.call);
+  const lw = last ? callWords(last, useGame.getState().table.round) : null;
   return (
     <Sheet id="tape" title="The Tape" testid="tape">
+      {last && !last.dismissed && (
+        <div className={"lastcall " + last.outcome} data-testid="lastcall" data-call={last.outcome} data-settled={last.settled ?? ""}>
+          <div className="lc-h">
+            <span className="lc-r">{`Round ${last.round} · your call`}</span>
+            {lw!.done && (
+              <button className="linkbtn" onClick={dismissLastCall}>
+                OK
+              </button>
+            )}
+          </div>
+          <p className="lc-t">{lw!.title}</p>
+          <p className="lc-d">{lw!.detail}</p>
+        </div>
+      )}
       <p className="cost">{chain ? "One call costs 0.01 devnet SOL · free from the faucet" : "Demo calls are free"}</p>
       <p className="lede">Call which desk finishes on top. One call per round; the pot is split among the right calls.</p>
       <div className="tape-status">
@@ -88,7 +105,7 @@ export function TapeSheet() {
                 <span className="t">{i === mySeat ? "You" : s.name}</span>
                 {s.kind === "bot" && <span className="bot">bot</span>}
               </span>
-              <span className="pool">{tape.pool[i] > 0 ? `${staked(tape.pool[i])} · pays ${odds}` : "no calls yet"}</span>
+              <span className="pool">{tape.pool[i] > 0 ? `${staked(tape.pool[i])} · pays ${odds}` : called ? "your call · counting…" : "no calls yet"}</span>
               <button
                 className={"call" + (called ? " called" : "")}
                 data-called={called ? "1" : undefined}
