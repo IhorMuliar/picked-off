@@ -150,6 +150,8 @@ export interface PrivateResult {
   algo: boolean;
   /** For fill: the next skim at the same level (tenths). */
   next?: number;
+  /** For fill: how many hidden orders this ping took from (one skim each). */
+  orders?: number;
 }
 
 export interface TapeView {
@@ -212,6 +214,14 @@ export interface Latency {
   n: number;
 }
 
+/** Where this browser stands with its seat (chain driver; the mock leaves it unset). */
+export type SeatState = "connecting" | "joining" | "waiting" | "seated" | "released";
+/** One status line for the screen (connection, seat, Tape notes). */
+export interface StatusLine {
+  kind: "connecting" | "offline" | "waiting" | "info";
+  text: string;
+}
+
 /** Everything the screen renders. */
 export interface GameView {
   ready: boolean;
@@ -227,6 +237,12 @@ export interface GameView {
   reveal: RevealView | null;
   latency: Latency;
   error: string | null;
+  /** Seat status (optional: drivers that always seat the player may leave it unset). */
+  seatState?: SeatState;
+  /** The driver's current status line, or null when there is nothing to say. */
+  banner?: StatusLine | null;
+  /** The seat goes back to a bot at the next round unless the player acts (ping, move, hide, call or join). */
+  seatAtRisk?: boolean;
 }
 
 /** Player intent. The driver implements these; all are fire-and-forget. */

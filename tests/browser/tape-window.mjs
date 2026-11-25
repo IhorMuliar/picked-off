@@ -28,9 +28,11 @@ const SEND_PROBE = `(() => { const f = window.fetch; window.__baseSends = [];
   };
 })();`;
 
+// the Tape lives in a sheet: the snapshot opens it when it is closed (the results sheet replaces it at each bell)
 const SNAP = `(() => { const s = window.__poChain?.status?.();
+  if (!document.querySelector('[data-testid=tape]') && !document.querySelector('[data-testid=reveal]')) document.querySelector('.chip.tape')?.click();
   return { s, label: document.querySelector('[data-testid=tape-window]')?.textContent ?? null,
-    buttons: [...document.querySelectorAll('[data-testid=tape] button')].map((e) => (e.disabled ? '-' : '+') + e.textContent),
+    buttons: [...document.querySelectorAll('[data-testid=tape] button.call')].map((e) => (e.disabled ? '-' : '+') + (e.dataset.called ? 'CALLED' : e.textContent)),
     toasts: [...document.querySelectorAll('[data-testid=toasts] .toast')].map((e) => e.textContent),
     banner: (() => { const e = document.querySelector('[data-testid=chain-status]'); return e && e.style.display !== 'none' ? e.textContent : null })(),
     sends: window.__baseSends?.length ?? 0, sendLog: window.__baseSends ?? [] } })()`;
@@ -52,12 +54,12 @@ try {
     const round = x.s.round, pool = x.s.tableId;
     await sleep(Math.max(0, t0 + 1500 - Date.now()));
     const early = await b.ev(SNAP);
-    if (early.label === "no Tape this round") { results.push({ target, pool, round, skipped: "unrecorded round" }); continue; }
+    if (/^no Tape this round/i.test(early.label ?? "")) { results.push({ target, pool, round, skipped: "unrecorded round" }); continue; }
     await sleep(Math.max(0, t0 + target - Date.now()));
     const before = await b.ev(SNAP);
     const i = before.buttons.findIndex((t) => t.startsWith("+"));
     const clickAt = Date.now() - t0;
-    await b.ev(`document.querySelectorAll('[data-testid=tape] button')[${i >= 0 ? i : 0}].click()`); // a disabled button ignores the click
+    await b.ev(`document.querySelectorAll('[data-testid=tape] button.call')[${i >= 0 ? i : 0}].click()`); // a disabled button ignores the click
     let after = before, calledMs = null;
     for (let k = 0; k < 60; k++) {
       await sleep(250);
@@ -66,7 +68,7 @@ try {
     }
     const sent = after.sendLog.slice(before.sends);
     const r = { target, pool, round, clickAtMs: clickAt, labelBefore: before.label, enabledBefore: i >= 0, called: calledMs !== null, calledMs, baseSends: sent.length, sendResults: sent.map((s) => s.ok), labelAfter: after.label, toasts: after.toasts.slice(-2), banner: after.banner };
-    r.pass = target <= 20_000 ? r.called && sent.every((s) => s.ok === "accepted") : !r.enabledBefore && sent.length === 0 && /closed/.test(before.label ?? "");
+    r.pass = target <= 20_000 ? r.called && sent.every((s) => s.ok === "accepted") : !r.enabledBefore && sent.length === 0 && /closed/i.test(before.label ?? "");
     results.push(r);
     console.log(JSON.stringify(r));
   }

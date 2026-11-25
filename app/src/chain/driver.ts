@@ -7,10 +7,10 @@
  * Tape and sends calls on the base layer, and after the bell replays the committed round
  * record in the browser and checks it against the published commit hash.
  */
-import { Keypair, PublicKey, SYSVAR_CLOCK_PUBKEY, Transaction, type Connection, type TransactionInstruction } from "@solana/web3.js";
+import { Connection as Web3Connection, Keypair, PublicKey, SYSVAR_CLOCK_PUBKEY, Transaction, type Connection, type TransactionInstruction } from "@solana/web3.js";
 import {
   BEAT_MS, DESKS, LEVELS, LIGHTS_MS, TAPE_CLOSE_BEAT,
-  type GameActions, type GameDriver, type MyDesk, type PeekProbe, type Phase, type StoreWriter, type TapeView,
+  type GameActions, type GameDriver, type MyDesk, type PeekProbe, type Phase, type SeatState, type StoreWriter, type TapeView,
 } from "../state/types";
 import { chainConfig, type ChainConfig } from "./config";
 import { loadOrCreateBurner, exportBurner, storage, TokenStore, type Burner } from "./burner";
@@ -113,6 +113,10 @@ class ChainDriver implements GameDriver {
   private joining = false;
   private announceJoin = false;
   private slotFails = 0;
+  /** Public first frame: the Table read without a token while the sign-in runs (display only, never for sending). */
+  private previewClock: SlotClock;
+  private lastSeatState: SeatState | null = null;
+  private lastBannerKey = "";
 
   private worker: Worker | null = null;
   private workerSetupFor: string | null = null;
@@ -198,6 +202,7 @@ class ChainDriver implements GameDriver {
     this.tee = new TeeLink(cfg, this.tokens);
     this.base = new BaseLink(cfg);
     this.clock = new SlotClock(cfg.slotMs);
+    this.previewClock = new SlotClock(cfg.slotMs);
     this.playerLabel = this.playerName();
   }
 
@@ -246,6 +251,8 @@ class ChainDriver implements GameDriver {
   }
 
   private async boot() {
+    // 0. the Table is public: show the live pool at once while the sign-in and the join run
+    void this.preview();
     // 1. rollup login (no popup: the burner signs the challenge)
     for (let delay = 1000; !this.stopped; delay = Math.min(delay * 2, 10_000)) {
       try {
@@ -272,6 +279,42 @@ class ChainDriver implements GameDriver {
     while (!this.stopped && this.tableId === null) {
       await this.pickTable();
       if (this.tableId === null) await sleep(3000);
+    }
+  }
+
+  /**
+   * The first frame: until the signed-in connection has picked a pool, read the pools' public Table anonymously and
+   * write only the public view (seats, tallies, clock) to the screen. It touches none of the driver's round, seat or
+   * sending state, and its clock is used only for display before the real slot clock is fitted.
+   */
+  private async preview() {
+    const anon = new Web3Connection(this.cfg.teeRpc, { commitment: "processed", disableRetryOnRateLimit: true });
+    const ids = this.cfg.tableIds;
+    while (!this.stopped && this.tableId === null) {
+      try {
+        const t0 = now();
+        const slot = await anon.getSlot("processed");
+        this.previewClock.add(slot, t0, now());
+        const tables: Table[] = [];
+        for (const id of ids) {
+          const a = await anon.getAccountInfo(this.pdas.table(id), "processed").catch(() => null);
+          if (a && isAccount(Uint8Array.from(a.data), "Table")) tables.push(decodeTable(Uint8Array.from(a.data)));
+        }
+        if (this.tableId !== null || this.stopped) break;
+        const humans = (t: Table) => t.seats.filter((x) => x.kind === SEAT.human).length;
+        const pick = tables.find((t) => t.seats.some((x) => x.key === this.burner.address)) ?? tables.filter((t) => this.hasFreeSeat(t)).sort((a, b) => humans(a) - humans(b))[0] ?? tables[0];
+        if (pick) {
+          const counts = pick.beatCounts[pick.beat] ?? [0, 0];
+          this.w.set((s) => ({
+            ready: true,
+            table: { ...s.table, pool: String(pick.tableId).padStart(4, "0"), round: Number(pick.round), seats: seatsView(pick), mySeat: null, lastPings: counts[0], lastFills: counts[1], source: this.cfg.cluster },
+            clock: this.clockOf(pick, (slot) => this.previewClock.timeOf(slot) ?? now()),
+          }));
+        }
+      } catch {
+        /* the signed-in path retries on its own */
+      }
+      await sleep(700);
     }
   }
 
@@ -440,26 +483,32 @@ class ChainDriver implements GameDriver {
       // no "take a desk" offer while a join is already in flight or queued for the next free desk
       canJoin: (this.released || (this.seat === null && !this.joining && !this.waitingSeat)) && t.kind === TABLE_KIND.house,
       clock: this.clockOf(t),
+      seatAtRisk: this.seatAtRisk(),
     }));
     this.updatePlan();
     this.refreshBanner();
+  }
+
+  /** No input this round and seated since an earlier round: the next round releases the seat (see newRound). */
+  private seatAtRisk(): boolean {
+    return this.seat !== null && !this.released && !this.keepSeat && this.seatedRound !== null && this.round !== null && this.round - this.seatedRound >= 1n;
   }
 
   private timeOf(slot: bigint): number {
     return this.clock.timeOf(slot) ?? now();
   }
 
-  private clockOf(t: Table) {
+  private clockOf(t: Table, timeOf: (slot: bigint) => number = (x) => this.timeOf(x)) {
     const phase: Phase =
       t.phase === PHASE.hide ? "hide" : t.phase === PHASE.live ? "live" : t.phase >= PHASE.bell ? "lights" : "connecting";
     const beat = phase === "live" ? t.beat + 1 : phase === "lights" ? t.beat : 0;
     // in HIDE the program has not set hide_end_slot yet (0): the HIDE deadline is next_deadline_slot
-    const liveStartedAt = this.timeOf(t.phase === PHASE.hide ? t.nextDeadlineSlot : t.hideEndSlot);
+    const liveStartedAt = timeOf(t.phase === PHASE.hide ? t.nextDeadlineSlot : t.hideEndSlot);
     return {
       phase,
       beat,
       phaseEndsAt: phase === "hide" ? liveStartedAt : phase === "lights" ? (this.bellAt ?? now()) + LIGHTS_MS : 0,
-      beatEndsAt: phase === "live" ? this.timeOf(t.nextDeadlineSlot) : 0,
+      beatEndsAt: phase === "live" ? timeOf(t.nextDeadlineSlot) : 0,
       liveStartedAt,
       bellChance: phase === "live" ? bellChance(beat) : 0,
     };
@@ -615,7 +664,8 @@ class ChainDriver implements GameDriver {
               nextSkim = res.next ?? nextSkim;
             } else if (lastFill === res.level) lastFill = null;
           }
-          this.w.pushResult(latencyMs === undefined ? res : { ...res, latencyMs });
+          const shown = res.kind === "fill" ? { ...res, orders: r.victims } : res;
+          this.w.pushResult(latencyMs === undefined ? shown : { ...shown, latencyMs });
         }
       }
       if (top > this.seenDeskBeat) this.seenDeskBeat = top;
@@ -778,6 +828,7 @@ class ChainDriver implements GameDriver {
 
   private join() {
     this.keepSeat = true;
+    this.w.set({ seatAtRisk: false });
     if (this.seat !== null && this.released) {
       // the seat is still ours on chain: take it back without a transaction
       this.released = false;
@@ -1127,7 +1178,18 @@ class ChainDriver implements GameDriver {
     else if (t.phase === PHASE.idle) b = { kind: "waiting", text: "waiting for the house to open the first round" };
     else if (this.dripping) b = { kind: "connecting", text: "getting devnet SOL for your Tape call from the drip" };
     else if (this.needsFunding) b = { kind: "info", text: `Tape calls need devnet SOL on this browser's key ${this.burner.address.slice(0, 6)}…` };
-    this.banner.show(b);
+    // the screen renders the status line itself (one place, no overlay)
+    const key = b ? `${b.kind}:${b.text}` : "";
+    if (key !== this.lastBannerKey) {
+      this.lastBannerKey = key;
+      this.w.set({ banner: b });
+    }
+    const seat: SeatState =
+      this.seat !== null ? (this.released ? "released" : "seated") : this.joining ? "joining" : this.waitingSeat ? "waiting" : !t || !this.tee.connection ? "connecting" : "joining";
+    if (seat !== this.lastSeatState) {
+      this.lastSeatState = seat;
+      this.w.set({ seatState: seat });
+    }
   }
 
   private status(): ChainStatus {

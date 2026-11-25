@@ -13,7 +13,7 @@
  * <outDir>/events.jsonl logs the clock, toasts, header number, reveal check and every input sent.
  *
  * Env: ROUNDS=7 (full rounds to record after the join round) · VW=1280 VH=720 ZOOM=1.5 · QUALITY=88 ·
- *      TAPE_CALLS=2 · PEEK_ROUND=3 · CAPTURE_FROM=0 · EVERY_NTH=1 · JOIN_HOLD_MS=4000 · CHROME=<binary>
+ *      TAPE_CALLS=2 · PEEK_ROUND=3 · CAPTURE_FROM=0 · EVERY_NTH=1 · CHROME=<binary>
  */
 import { spawn, execFileSync } from "node:child_process";
 import fs from "node:fs";
@@ -138,14 +138,14 @@ async function key(k, code, vk, what) {
   log({ input: "key", key: code, what });
 }
 
-const SNAP = `(() => { const q = (s) => document.querySelector(s); const s = window.__poChain?.status?.();
-  return { clock: q('[data-testid=clock]')?.textContent ?? '',
+const SNAP = `(() => { const q = (s) => document.querySelector(s); const s = window.__poChain?.status?.(); const c = q('[data-testid=clock]');
+  return { clock: c ? c.dataset.phase + ' ' + c.dataset.beat : '',
     toasts: [...document.querySelectorAll('[data-testid=toasts] .toast')].map((e) => e.textContent),
     number: q('[data-testid=number]')?.textContent ?? '',
     check: q('[data-testid=check]')?.textContent ?? null,
     reveal: !!q('[data-testid=reveal]'), peek: !!q('[data-testid=peek]'),
     takedesk: !!q('[data-testid=takedesk]'), join: !!q('[data-testid=join]'),
-    tape: [...document.querySelectorAll('[data-testid=tape] button')].map((e) => (e.disabled ? '-' : '+') + e.textContent),
+    tape: [...document.querySelectorAll('[data-testid=tape] button.call')].map((e) => (e.disabled ? '-' : '+') + (e.dataset.called ? 'CALLED' : e.textContent)),
     banner: (() => { const e = q('[data-testid=chain-status]'); return e && e.style.display !== 'none' ? e.textContent : null })(),
     seat: s?.seat ?? null, round: s?.round ?? null, readable: !!s?.deskReadable } })()`;
 
@@ -167,8 +167,6 @@ if (!CAPTURE_FROM) {
 await send("Page.navigate", { url });
 log({ nav: url });
 
-const JOIN_HOLD_MS = Number(env("JOIN_HOLD_MS", 4000));
-const joinSeenAt = {};
 let last = {}, full = -1, lastRound = null, lastBeat = -1, calls = 0, peeked = false, lastPull = Date.now();
 const done = new Set();
 const t0 = Date.now();
@@ -204,22 +202,18 @@ try {
       if (full > ROUNDS) break;
     }
     const r = x.round;
-    const hide = x.clock.includes("HIDE");
-    const beat = Number(/beat (\d+)/.exec(x.clock)?.[1] ?? 0);
+    const hide = x.clock.startsWith("hide");
+    const beat = x.clock.startsWith("live") ? Number(x.clock.split(" ")[1]) : 0;
     // the Tape call goes first in HIDE: on chain, calls can close earlier than the panel says
     if (hide && full >= 1 && calls < TAPE_CALLS && full % 2 === 0 && !done.has(`tape:${r}`)) {
+      if (!x.tape.length) await click(".chip.tape", "open the Tape");
       const i = x.tape.findIndex((t) => t.startsWith("+"));
       if (i >= 0) {
         done.add(`tape:${r}`);
         calls++;
-        await click("[data-testid=tape] .row button", "tape call (own desk)", x.seat);
+        await click("[data-testid=tape] button.call", "tape call (own desk)", x.seat);
+        await key("Escape", "Escape", 27, "close the Tape");
       }
-    }
-    // keep the "You're in" notice on screen for JOIN_HOLD_MS, then GOT IT
-    if (x.join && !(r in joinSeenAt)) joinSeenAt[r] = Date.now();
-    if (x.join && !hide && Date.now() - joinSeenAt[r] > JOIN_HOLD_MS && !done.has(`got:${r}`)) {
-      done.add(`got:${r}`);
-      await click(".notice .go", "GOT IT");
     }
     if (hide && !done.has(`place:${r}`)) {
       done.add(`place:${r}`);
@@ -246,10 +240,10 @@ try {
         continue;
       }
       await sleep(250 + Math.random() * 500);
-      const mine = x.toasts.join(" ");
-      if (/PICKED OFF/.test(mine)) await key("r", "KeyR", 82, "requote");
-      else if (/FILL/.test(mine) && !/ALGO FILL/.test(mine)) await key(" ", "Space", 32, "re-ping fill");
-      else if (/ALGO FILL/.test(mine)) await key(" ", "Space", 32, "re-ping algo fill");
+      // the result log: "FILL …", "auto FILL …", "miss …", "auto miss …", "PICKED OFF …"
+      if (x.toasts.some((t) => t.startsWith("PICKED OFF"))) await key("r", "KeyR", 82, "move");
+      else if (x.toasts.some((t) => t.startsWith("FILL"))) await key(" ", "Space", 32, "ping the fill again");
+      else if (x.toasts.some((t) => t.startsWith("auto FILL"))) await key(" ", "Space", 32, "ping the auto fill again");
       else if (Math.random() < 0.8) await click(`[data-level="${1 + Math.floor(Math.random() * 24)}"]`, "ping");
     }
   }

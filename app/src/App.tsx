@@ -1,23 +1,56 @@
+import { useEffect } from "react";
 import { Header } from "./ui/Header";
-import { Pool } from "./ui/Pool";
-import { Side } from "./ui/Side";
-import { Ticker } from "./ui/Ticker";
-import { Peek } from "./ui/Peek";
-import { Reveal } from "./ui/Reveal";
+import { Score } from "./ui/Score";
+import { Book } from "./ui/Book";
+import { ActionBar, Hint } from "./ui/Action";
+import { DesksSheet, Rail } from "./ui/Desks";
+import { TapeSheet } from "./ui/Tape";
+import { ProofSheet } from "./ui/Proof";
+import { ResultsSheet } from "./ui/Results";
+import { ResultLog } from "./ui/ResultLog";
+import { useKeys } from "./ui/keys";
+import { feedRound } from "./ui/round";
+import { openSheet, useGame, useUi } from "./state/store";
 import { unlockAudio } from "./fx/sound";
 import "./ui/styles.css";
 
+/** Opens the results at the bell (shortly after the book lights up) and closes them when the next round starts. */
+function useResultsSheet() {
+  const round = useGame((s) => s.reveal?.round ?? null);
+  useEffect(() => {
+    if (round === null) {
+      if (useUi.getState().sheet === "results") openSheet(null);
+      return;
+    }
+    const t = setTimeout(() => {
+      if (useUi.getState().resultsClosed !== round) openSheet("results");
+    }, 900);
+    return () => clearTimeout(t);
+  }, [round]);
+}
+
 export function App() {
+  useKeys();
+  useResultsSheet();
+  useEffect(() => feedRound(), []);
+  const sheet = useUi((s) => s.sheet);
   return (
-    <div onPointerDown={unlockAudio} onKeyDown={unlockAudio}>
+    <div className={"app" + (sheet ? " has-sheet sheet-" + sheet : "")} onPointerDown={unlockAudio} onKeyDown={unlockAudio}>
       <Header />
-      <main>
-        <Pool />
-        <Side />
+      <main className="play" data-testid="pool">
+        <div className="stage">
+          <Score />
+          <Book />
+          <Hint />
+          <ActionBar />
+        </div>
+        <Rail />
       </main>
-      <Ticker />
-      <Reveal />
-      <Peek />
+      <ResultLog />
+      <DesksSheet />
+      <TapeSheet />
+      <ProofSheet />
+      <ResultsSheet />
     </div>
   );
 }

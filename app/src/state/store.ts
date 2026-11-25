@@ -51,14 +51,22 @@ export function recordLatency(round: number, beat: number, ms: number) {
 }
 
 /* ---- local UI state (not part of the driver contract) ---- */
+export type SheetId = "desks" | "tape" | "proof" | "results";
 interface UiState {
+  /** Keyboard cursor on the book (a level), shown only after an arrow key. */
   selected: number;
+  cursorOn: boolean;
+  /** Move to…: the next tap on a price moves the order there. */
   moveMode: boolean;
   muted: boolean;
-  peekOpen: boolean;
-  revealOpen: boolean;
+  /** The open sheet, if any. */
+  sheet: SheetId | null;
+  /** The round whose results sheet the player closed. */
+  resultsClosed: number | null;
   interacted: boolean;
   beatTick: boolean;
+  /** Kept for older hooks: the proof sheet is open. */
+  peekOpen: boolean;
 }
 const readMuted = () => {
   try {
@@ -68,11 +76,14 @@ const readMuted = () => {
   }
 };
 export const useUi = create<UiState>()(() => ({
-  selected: 12,
+  selected: 13,
+  cursorOn: false,
   moveMode: false,
   muted: readMuted(),
-  peekOpen: false,
-  revealOpen: true,
+  sheet: null,
+  resultsClosed: null,
   interacted: false,
   beatTick: true,
+  peekOpen: false,
 }));
+export const openSheet = (sheet: SheetId | null) => useUi.setState({ sheet, peekOpen: sheet === "proof" });

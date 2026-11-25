@@ -9,7 +9,7 @@
  *          the 5 peek reads; the header number (beat -> private result); no uncaught errors
  *   tape   (only with TAPE=1: spends devnet SOL from the drip) one Tape call: CALLED, then claimed
  *
- * Env: CHECKS=join,round (default) · JOIN_N=5 · JOIN_GAP_MS=12000 · ROUNDS=2 · TAPE=1 ·
+ * Env: CHECKS=join,round (default) · JOIN_N=5 · JOIN_GAP_MS=12000 · JOIN_PAR=2 (simultaneous joins, 0 = none) · ROUNDS=2 · TAPE=1 ·
  *      SHOTS=<dir for screenshots> · OUT=<file for the JSON report> · CHROME=<binary>
  * Prints one PASS/FAIL line per check and exits 1 if any failed.
  */
@@ -67,19 +67,22 @@ async function checkJoin() {
     runs.push(await joinOnce());
     await sleep(Number(env("JOIN_GAP_MS", 12000)));
   }
-  runs.push(...(await Promise.all([joinOnce(), joinOnce()])));
+  const par = Number(env("JOIN_PAR", 2));
+  if (par > 0) runs.push(...(await Promise.all(Array.from({ length: par }, () => joinOnce()))));
   const ms = runs.map((r) => r.ms ?? Infinity);
   const ok = ms.filter((x) => x <= 10000).length;
-  line("join", ok === runs.length, { ok: `${ok}/${runs.length}`, min: Math.min(...ms), p50: pct(ms, 0.5), p95: pct(ms, 0.95), max: Math.max(...ms), simultaneous: runs.slice(-2).map((r) => r.ms) });
+  line("join", ok === runs.length, { ok: `${ok}/${runs.length}`, min: Math.min(...ms), p50: pct(ms, 0.5), p95: pct(ms, 0.95), max: Math.max(...ms), simultaneous: par > 0 ? runs.slice(-par).map((r) => r.ms) : [] });
   report.checks.join.runs = runs;
 }
 
 /* ---------------------------------------------------------------- round (+ tape) */
-const SNAP = `(() => { const q = (s) => document.querySelector(s); const s = window.__poChain?.status?.();
-  return { clock: q('[data-testid=clock]')?.textContent ?? '',
+// the screen's hooks: the clock carries its phase and beat as data; private results are a screen-reader log
+// ([data-testid=toasts] .toast); the Tape's buttons exist while its sheet is open (opened by the check when needed)
+const SNAP = `(() => { const q = (s) => document.querySelector(s); const s = window.__poChain?.status?.(); const c = q('[data-testid=clock]');
+  return { clock: c ? c.dataset.phase + ' ' + c.dataset.beat : '',
     toasts: [...document.querySelectorAll('[data-testid=toasts] .toast')].map((e) => e.textContent),
     check: q('[data-testid=check]')?.textContent ?? null,
-    tape: [...document.querySelectorAll('[data-testid=tape] button')].map((e) => (e.disabled ? '-' : '+') + e.textContent),
+    tape: [...document.querySelectorAll('[data-testid=tape] button.call')].map((e) => (e.disabled ? '-' : '+') + (e.dataset.called ? 'CALLED' : e.textContent)),
     banner: (() => { const e = q('[data-testid=chain-status]'); return e && e.style.display !== 'none' ? e.textContent : null })(),
     number: q('[data-testid=number]')?.textContent ?? '', s } })()`;
 
@@ -106,11 +109,11 @@ async function checkRound(withTape) {
         last = r;
         if (full > rounds) break;
       }
-      const hide = x.clock.includes("HIDE");
-      const beat = Number(/beat (\d+)/.exec(x.clock)?.[1] ?? 0);
+      const hide = x.clock.startsWith("hide");
+      const beat = x.clock.startsWith("live") ? Number(x.clock.split(" ")[1]) : 0;
       const key = (k) => `${k}:${r}`;
       for (const t of x.toasts) seen.toasts.add(`${r}:${t}`);
-      if (x.clock.includes("bell") && !done.has(key("bell"))) {
+      if (x.clock.startsWith("lights") && !done.has(key("bell"))) {
         done.add(key("bell"));
         seen.bells++;
         if (seen.bells === 1) await shot(b, "browser-bell.png");
@@ -120,7 +123,7 @@ async function checkRound(withTape) {
         seen.replays++;
         if (seen.replays === 1) await shot(b, "browser-reveal.png");
       }
-      if (/ms p95/.test(x.number) && !seen.headerFirst) seen.headerFirst = x.number;
+      if (/\d+ ms/.test(x.number) && !seen.headerFirst) seen.headerFirst = x.number;
       if (/settled and (claimed|paid)/.test(x.banner ?? "")) claimed = x.banner;
       if (full < 1) continue; // the join round is not a full round
       if (hide && !done.has(key("place"))) {
@@ -129,21 +132,22 @@ async function checkRound(withTape) {
         if (seen.places === 1) await shot(b, "browser-hide.png");
       }
       if (withTape && hide && full >= 2 && !call) {
+        if (!x.tape.length) await b.click(".chip.tape"); // open the Tape sheet; its buttons show on the next snapshot
         const i = x.tape.findIndex((t) => t.startsWith("+"));
         if (i >= 0) {
           call = { round: r, at: Date.now() };
-          await b.ev(`document.querySelectorAll('[data-testid=tape] button')[${i}].click()`);
+          await b.ev(`document.querySelectorAll('[data-testid=tape] button.call')[${i}].click()`);
         }
       }
       if (call && !call.calledMs && x.tape.some((t) => t.includes("CALLED"))) call.calledMs = Date.now() - call.at;
       if (!hide && beat >= 2 && !done.has(key("ping"))) {
         done.add(key("ping"));
-        await b.click(`[data-level="${2 + Math.floor(Math.random() * 20)}"]`);
-        if (await b.click(".actions .btn.ping")) seen.pings++;
+        // a tap on a price is the ping
+        if (await b.click(`[data-level="${2 + Math.floor(Math.random() * 20)}"]`)) seen.pings++;
       }
       if (!hide && beat >= 5 && !done.has(key("requote"))) {
         done.add(key("requote"));
-        await b.click(".actions .btn.move");
+        await b.click("[data-testid=move]"); // Move to…, then the price
         if (await b.click(`[data-level="${2 + Math.floor(Math.random() * 20)}"]`)) seen.requotes++;
         if (seen.requotes === 1) await shot(b, "browser-live.png");
       }

@@ -1,16 +1,15 @@
-/** 30-px desk glyphs drawn in SVG (no image assets). */
+/** 24-px desk glyphs drawn in SVG (no image assets). Neutral: only your own is in your colour. */
 import type { Seat } from "../state/types";
 
 export function Glyph({ seat, you }: { seat: Seat; you?: boolean }) {
-  const bg = you ? "#22305a" : "#1b2340";
-  const c = "#B48CFF";
+  const c = you ? "var(--you)" : "var(--n6)";
   return (
     <svg className="av" viewBox="0 0 30 30" aria-hidden="true">
-      <rect width="30" height="30" rx="8" fill={bg} />
+      <rect width="30" height="30" rx="8" fill="var(--n2)" />
       {seat.kind === "human" ? (
         <>
-          <circle cx="15" cy="12" r="4.5" fill={you ? "#8FA8FF" : "#E8ECF4"} />
-          <path d="M7 25 a8 7 0 0 1 16 0z" fill={you ? "#8FA8FF" : "#E8ECF4"} />
+          <circle cx="15" cy="12" r="4.5" fill={c} />
+          <path d="M7 25 a8 7 0 0 1 16 0z" fill={c} />
         </>
       ) : seat.bot === "shark" ? (
         <>
@@ -20,8 +19,8 @@ export function Glyph({ seat, you }: { seat: Seat; you?: boolean }) {
       ) : seat.bot === "ghost" ? (
         <>
           <path d="M8 24 V13 a7 7 0 0 1 14 0 V24 l-3.5-2 -3.5 2 -3.5-2z" fill={c} opacity=".85" />
-          <circle cx="12.5" cy="14" r="1.5" fill="#0E1320" />
-          <circle cx="17.5" cy="14" r="1.5" fill="#0E1320" />
+          <circle cx="12.5" cy="14" r="1.5" fill="var(--n2)" />
+          <circle cx="17.5" cy="14" r="1.5" fill="var(--n2)" />
         </>
       ) : (
         <>

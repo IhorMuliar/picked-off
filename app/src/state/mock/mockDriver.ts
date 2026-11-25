@@ -143,6 +143,8 @@ export class MockDriver implements GameDriver {
       reveal: null,
       canJoin: !this.seated,
       results: [],
+      seatState: this.seated ? "seated" : "released",
+      seatAtRisk: this.seated,
     });
     if (first) {
       // instant join: skip HIDE, play a few beats so the book already has marks
@@ -256,7 +258,7 @@ export class MockDriver implements GameDriver {
           const vs = res.fills.filter((f) => f.pinger === 0).map((f) => f.victim);
           nextSkim = Math.max(...vs.map((v) => SKIM[Math.min(this.book.streak[0][v], 2)]));
         } else if (lastFill === p.level) lastFill = null;
-        if (!silent) this.w.pushResult({ beat, kind: p.tenths > 0 ? "fill" : "miss", level: p.level, tenths: p.tenths, algo: p.algo, next: p.tenths > 0 ? nextSkim : undefined });
+        if (!silent) this.w.pushResult({ beat, kind: p.tenths > 0 ? "fill" : "miss", level: p.level, tenths: p.tenths, algo: p.algo, next: p.tenths > 0 ? nextSkim : undefined, orders: p.tenths > 0 ? res.fills.filter((f) => f.pinger === 0).length : undefined });
       }
       const moved = res.actions[0].kind === "requote";
       if (moved) lastFill = lastFill === this.book.level[0] ? null : lastFill;
@@ -332,9 +334,15 @@ export class MockDriver implements GameDriver {
 
   /* ------------------------------------------------------------ actions */
 
+  /** Any player input keeps the seat for the next round. */
+  private keep() {
+    this.keepSeat = true;
+    if (this.w.get().seatAtRisk) this.w.set({ seatAtRisk: false });
+  }
+
   private place(level: number) {
     if (!this.seated || !this.me || level < 1 || level > LEVELS) return;
-    this.keepSeat = true;
+    this.keep();
     if (this.phase === "hide") {
       this.book.level[0] = level;
       this.placed = true;
@@ -344,7 +352,7 @@ export class MockDriver implements GameDriver {
 
   private ping(level: number) {
     if (!this.seated || !this.me || this.phase !== "live" || level < 1 || level > LEVELS) return;
-    this.keepSeat = true;
+    this.keep();
     this.lastActBeat = this.beat;
     this.myAct = { kind: "ping", level };
     this.setMe({ pending: { kind: "ping", level } });
@@ -357,7 +365,7 @@ export class MockDriver implements GameDriver {
       return;
     }
     if (this.phase !== "live") return;
-    this.keepSeat = true;
+    this.keep();
     this.lastActBeat = this.beat;
     let L = level;
     if (L === null) {
@@ -376,12 +384,12 @@ export class MockDriver implements GameDriver {
     if (s.tape.myCall !== null || desk < 0 || desk >= DESKS) return;
     if (this.phase === "lights" || (this.phase === "live" && this.beat > TAPE_CLOSE_BEAT)) return;
     this.calls++;
-    this.keepSeat = true;
+    this.keep();
     this.w.set({ tape: { ...s.tape, myCall: desk, pool: s.tape.pool.map((v, i) => (i === desk ? v + 1 : v)) } });
   }
 
   private join() {
-    this.keepSeat = true;
+    this.keep();
     if (this.seated) return;
     // take over seat 0 as it stands (its level and lots become yours)
     this.seated = true;
@@ -392,7 +400,7 @@ export class MockDriver implements GameDriver {
     me.nextAlgo = this.algo[0];
     this.me = me;
     this.w.set((s) => ({
-      me, canJoin: false,
+      me, canJoin: false, seatState: "seated", seatAtRisk: false,
       table: { ...s.table, seats: this.seats(), mySeat: 0 },
       joinNotice: { name: this.player, seat: 0, level: this.book.level[0], resting: this.book.resting[0] },
     }));
