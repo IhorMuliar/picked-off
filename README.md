@@ -1,6 +1,6 @@
 **PICKED OFF: a 50-second dark pool. Hide your order, ping for everyone else's, pick them off before the closing bell. Only MagicBlock's TEE knows where anyone is.**  
 ▶ **Play, no wallet: https://picked-off-smoky.vercel.app** · beat → private result **94 ms p95** (n = 354 beats, 10 fresh browser tabs, EU, 2026-11-24)  
-<!-- 60-s video: <VIDEO LINK> -->
+▶ **60-s video:** https://x.com/muliark/status/2125924011037032862
 
 A MagicBlock Solana Blitz v10 entry on Solana devnet and MagicBlock's TEE rollup.
 
